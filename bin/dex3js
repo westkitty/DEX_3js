@@ -1,0 +1,35 @@
+#!/bin/zsh
+set -u
+TOOLKIT="$HOME/.local/share/3d-lab"
+LAB="$HOME/.local/bin/3d-lab"
+case "${1:-help}" in
+  studio) [[ -x "$LAB" ]] || { print -u2 "3d-lab is missing"; exit 1; }; exec "$LAB" studio ;;
+  stop)
+    STOPPER="$HOME/.local/bin/dex3js-stop-owned.py"
+    [[ -f "$STOPPER" ]] || STOPPER="$(dirname "$0")/stop_owned.py"
+    /usr/bin/python3 "$STOPPER" || exit $?
+    [[ -x "$LAB" ]] || exit 0
+    exec "$LAB" stop
+    ;;
+  inspect)
+    if [[ -z "${2:-}" ]]; then print -u2 "Usage: dex3js inspect --project <path>"; exit 2; fi
+    project="${2}"
+    [[ "${2}" == "--project" ]] && project="${3:-}"
+    [[ -n "$project" && -f "$project/package.json" ]] || { print -u2 "Project package.json not found"; exit 2; }
+    [[ -x "$LAB" ]] || { print -u2 "3d-lab is missing"; exit 1; }
+    exec "$LAB" inspect --project "$project"
+    ;;
+  doctor)
+    echo "DEX 3js doctor"
+    echo "App: $([[ -d "$HOME/Applications/DEX 3js.app" ]] && echo "$HOME/Applications/DEX 3js.app" || echo not-installed)"
+    echo "CLI: $([[ -x "$HOME/.local/bin/dex3js" ]] && echo "$HOME/.local/bin/dex3js" || echo not-installed)"
+    echo "3d-lab: $([[ -x "$HOME/.local/bin/3d-lab" ]] && echo available || echo missing)"
+    if [[ -x "$LAB" ]]; then "$LAB" doctor; else
+      echo "DevTools MCP: $([[ -d "$TOOLKIT/threejs-devtools-mcp/node_modules" ]] && echo installed || echo missing)"
+      echo "Studio: $([[ -d "$TOOLKIT/ai-threejs-studio" ]] && echo installed || echo missing)"
+      echo "Codex/Claude connection: open each desktop client's MCP tools to verify; CLI does not assert connectivity."
+    fi
+    ;;
+  open) open "$HOME/Applications/DEX 3js.app" ;;
+  help|*) echo "Usage: dex3js {open|doctor|inspect --project PATH|studio|stop}" ;;
+esac

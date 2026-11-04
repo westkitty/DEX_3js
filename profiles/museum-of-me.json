@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "Museum of Me",
+  "url": "http://127.0.0.1:5173",
+  "actions": [
+    { "name": "Play Museum", "path": "/" },
+    { "name": "Museum Workshop", "path": "/?edit=1" },
+    { "name": "Developer Free Flight", "path": "/?devtools=1" },
+    { "name": "Interior Workbench", "path": "/workbench/" },
+    { "name": "Full Island Workbench", "path": "/workbench/?view=island" },
+    { "name": "Visitor Choreographer", "path": "/?choreo=1" },
+    { "name": "Browser Diagnostics (startup timing)", "path": "/?qa=1" }
+  ]
+}

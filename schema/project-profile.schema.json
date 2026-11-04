@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/westkitty/DEX_3js/schema/project-profile.schema.json",
+  "title": "DEX 3js project profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "name", "actions"],
+  "properties": {
+    "version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "url": { "type": "string", "format": "uri", "pattern": "^https?://(localhost|127\\.0\\.0\\.1)(:[0-9]+)?(/|$)" },
+    "actions": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["name", "path"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 80 }, "path": { "type": "string", "pattern": "^/(?!/)[^\\s\\\\]*$" } } } }
+  }
+}

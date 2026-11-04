@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "Example Three.js project",
+  "url": "http://127.0.0.1:5173",
+  "actions": [
+    { "name": "Play", "path": "/" },
+    { "name": "Workshop", "path": "/?edit=1" },
+    { "name": "Island workbench", "path": "/?view=island" }
+  ]
+}
