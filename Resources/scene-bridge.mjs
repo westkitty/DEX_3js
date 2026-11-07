@@ -22,6 +22,7 @@ const sessionID = sessionArg >= 0 ? (process.argv[sessionArg + 1] || randomUUID(
 const headless = process.argv.includes('--headless');
 const forceBrowserFallbackForTest = process.argv.includes('--test-force-browser-fallback');
 const testSessionMutations = process.argv.includes('--test-session-mutations');
+const reportBrowserIdentityForTest = process.argv.includes('--test-browser-identity');
 const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const browserFallbackGuard = path.join(path.dirname(fileURLToPath(import.meta.url)), 'no-browser-fallback');
 let client, transport, closed = false;
@@ -178,6 +179,9 @@ async function connect(project, url) {
       : {}),
     ...(forceBrowserFallbackForTest && process.env.DEX3JS_TEST_BROWSER_ATTEMPT_FILE
       ? { DEX3JS_TEST_BROWSER_ATTEMPT_FILE: process.env.DEX3JS_TEST_BROWSER_ATTEMPT_FILE }
+      : {}),
+    ...(forceBrowserFallbackForTest && process.env.DEX3JS_TEST_BROWSER_ARGS_FILE
+      ? { DEX3JS_TEST_BROWSER_ARGS_FILE: process.env.DEX3JS_TEST_BROWSER_ARGS_FILE }
       : {})
   };
   if (forceBrowserFallbackForTest && !childEnv.CHROME_PATH) throw new Error('Browser-fallback test requires a test-owned fake Chrome executable');
@@ -218,6 +222,7 @@ function sessionInfo(bridge = {}) {
     sessionID, projectPath: sessionProject, projectURL: sessionURL,
     browser: 'Google Chrome · isolated DEX profile', browserVersion,
     browserPID, browserTargetID, mcpPID, proxyURL, cdpPort,
+    ...(reportBrowserIdentityForTest ? { browserProfilePath, browserStartedAt } : {}),
     sessionStartedAt, lastActivityAt, lastSuccessfulInspection,
     owned: true, sceneBridgeConnected, sessionState: sceneBridgeConnected ? 'connected' : 'awaitingScene'
   };

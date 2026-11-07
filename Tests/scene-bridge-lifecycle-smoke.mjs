@@ -29,28 +29,40 @@ assert.match(nativeSource, /Live scene hierarchy/, 'the scene hierarchy must hav
 assert.match(nativeSource, /Selected scene object:/, 'the selected object must be announced accessibly');
 assert.match(nativeSource, /Inspector connection status:/, 'connection status must have an explicit assistive-technology label');
 assert.match(nativeSource, /supported material and a live scene connection/, 'preview must explain its disabled preconditions');
-assert.match(nativeSource, /willTerminateNotification\).*store\.cancelInspection\(\); store\.stop\(\)/, 'DEX intentionally stops its managed project on app exit; reattachment tests must model an externally surviving project separately');
+assert.match(nativeSource, /applicationShouldTerminate[\s\S]*?store\.shutdown[\s\S]*?terminateLater/, 'DEX must defer app termination until managed project and inspector cleanup completes');
+assert.match(nativeSource, /Logger\(subsystem: "com\.westkitty\.dex3js", category: "termination"\)/, 'termination diagnostics must remain queryable in the system log');
+for (const event of ['AppKit termination delegate invoked', 'shutdown begins', 'inspector cleanup begins', 'managed-project cleanup begins', 'shutdown resolved', 'AppKit termination reply']) {
+  assert.ok(nativeSource.includes(event), `termination trace is missing its required lifecycle event: ${event}`);
+}
 assert.match(nativeSource, /settings\.last-good\.json/, 'app reconstruction must retain the existing last-known-good settings recovery path');
 assert.match(nativeSource, /verifiedProjectProcessRecord\(\)/, 'reconstructed project state must be gated by process identity validation');
 assert.match(readFileSync(helper, 'utf8'), /no-browser-fallback/, 'the MCP child must resolve system-browser fallbacks through DEX’s refusing shim');
 assert.match(readFileSync(helper, 'utf8'), /verifyTemporaryDirectory\(\)/, 'temporary storage must be validated before MCP initialization');
 
 const sessionCount = Number(process.env.DEX_LIFECYCLE_CYCLES || 10);
-const chromeBefore = chromeProcessIDs();
+const chromeBefore = chromeIdentities();
 const args = { project: root, url: 'http://127.0.0.1:1/' };
 let completed = 0;
 
 function processTable() {
-  const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,command='], { encoding: 'utf8' });
+  const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,lstart=,command='], { encoding: 'utf8' });
   assert.equal(result.status, 0, `ps failed: ${result.stderr}`);
   return result.stdout.split('\n').map(line => {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
-    return match ? { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), command: match[4] } : null;
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.{24})\s+(.*)$/);
+    return match ? { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), startedAt: match[4].trim(), command: match[5] } : null;
   }).filter(Boolean);
 }
 function chromeProcessIDs() {
   return processTable().filter(item => item.command.startsWith('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'))
     .map(item => item.pid).sort((a, b) => a - b);
+}
+function chromeIdentities() {
+  return processTable().filter(item => item.command.startsWith('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'))
+    .map(({ pid, pgid, startedAt, command }) => ({ pid, pgid, startedAt, command })).sort((a, b) => a.pid - b.pid);
+}
+function profileChromeProcesses(profile) {
+  return processTable().filter(item => item.command.startsWith('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+    && item.command.includes(`--user-data-dir=${profile}`));
 }
 function mcpProcessIDs() {
   return processTable().filter(item => item.command.includes('/threejs-devtools-mcp/dist/index.js'))
@@ -187,21 +199,23 @@ async function verifyBrowserFallbackGuard() {
     console.log('PASS: invalid TMPDIR fails before MCP startup; forced Puppeteer failure reaches only the refusing open shim and starts no browser');
   } finally { await rm(scratch, { recursive: true, force: true }); }
 }
-async function verifyInterruptedInitializationRecovery() {
+async function verifyInterruptedInitializationRecovery(cycle) {
   const scratch = await mkdtemp(path.join(os.tmpdir(), 'dex3js-interrupted-start-'));
-  const browserBefore = chromeProcessIDs();
+  const browsersBefore = chromeIdentities();
   const mcpBefore = mcpProcessIDs();
   const marker = path.join(scratch, 'fallback-attempt.log');
   const attemptFile = path.join(scratch, 'launch-attempted');
+  const browserArgsFile = path.join(scratch, 'browser-args.log');
   const fakeChrome = path.join(scratch, 'chrome-on-second-attempt');
   const safePath = path.join(scratch, 'empty-path');
   await mkdir(safePath);
-  await writeFile(fakeChrome, `#!/bin/sh\nif [ ! -f "$DEX3JS_TEST_BROWSER_ATTEMPT_FILE" ]; then : > "$DEX3JS_TEST_BROWSER_ATTEMPT_FILE"; exit 73; fi\nexec "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$@"\n`);
+  await writeFile(fakeChrome, `#!/bin/sh\nif [ ! -f "$DEX3JS_TEST_BROWSER_ATTEMPT_FILE" ]; then : > "$DEX3JS_TEST_BROWSER_ATTEMPT_FILE"; exit 73; fi\nprintf '%s\\n' "$@" > "$DEX3JS_TEST_BROWSER_ARGS_FILE"\nexec "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$@"\n`);
   await chmod(fakeChrome, 0o700);
-  const child = spawn(process.execPath, [helper, '--session-id', `recover-init-${process.pid}`, '--headless', '--test-force-browser-fallback'], {
+  const child = spawn(process.execPath, [helper, '--session-id', `recover-init-${process.pid}-${cycle}`, '--headless', '--test-force-browser-fallback', '--test-browser-identity'], {
     cwd: root,
     env: { ...process.env, DEX3JS_TEST_CHROME_PATH: fakeChrome, DEX3JS_TEST_SAFE_PATH: safePath,
-      DEX3JS_TEST_BROWSER_LAUNCH_LOG: marker, DEX3JS_TEST_BROWSER_ATTEMPT_FILE: attemptFile },
+      DEX3JS_TEST_BROWSER_LAUNCH_LOG: marker, DEX3JS_TEST_BROWSER_ATTEMPT_FILE: attemptFile,
+      DEX3JS_TEST_BROWSER_ARGS_FILE: browserArgsFile },
     stdio: ['pipe', 'pipe', 'pipe']
   });
   let diagnostics = '';
@@ -235,6 +249,14 @@ async function verifyInterruptedInitializationRecovery() {
     session = recovered.result;
     assert.equal(session.owned, true);
     assert.equal(session.reused, false);
+    assert.ok(session.browserStartedAt && session.browserProfilePath, 'recovered browser identity must include process start and isolated profile');
+    const launchedArguments = await readFile(browserArgsFile, 'utf8');
+    assert.ok(launchedArguments.split('\n').includes(`--user-data-dir=${session.browserProfilePath}`), 'the fixture must bind Chrome cleanup to the exact profile launched by the test');
+    const launchedBrowser = processTable().find(item => item.pid === session.browserPID);
+    assert.ok(launchedBrowser && launchedBrowser.startedAt === session.browserStartedAt && launchedBrowser.pgid === launchedBrowser.pid,
+      'the recovered browser PID, start identity, and private process group must match the observed Chrome process');
+    const launchedMCP = processTable().find(item => item.pid === session.mcpPID);
+    assert.ok(launchedMCP && launchedMCP.ppid === child.pid, 'the MCP PID must remain a child of this fixture process');
     assert.equal(await fetch(`http://127.0.0.1:${session.cdpPort}/json/list`).then(response => response.status), 200);
   } finally {
     if (child.exitCode === null) {
@@ -243,10 +265,16 @@ async function verifyInterruptedInitializationRecovery() {
       if (child.exitCode === null) child.kill('SIGTERM');
     }
     if (session) {
-      await waitUntil(() => !processTable().some(item => item.pid === session.mcpPID || item.pid === session.browserPID), 'recovered test session did not release its owned processes');
+      await waitUntil(() => !processTable().some(item => item.pid === session.mcpPID || item.pid === session.browserPID), 'recovered test session did not release its owned process identities');
+      await waitUntil(() => profileChromeProcesses(session.browserProfilePath).length === 0,
+        `recovered DEX-owned browser profile remained after cleanup: ${JSON.stringify(profileChromeProcesses(session.browserProfilePath))}`);
       await assert.rejects(fetch(`http://127.0.0.1:${session.cdpPort}/json/version`, { signal: AbortSignal.timeout(500) }), 'recovered test session left CDP open');
     }
-    assert.deepEqual(chromeProcessIDs(), browserBefore, 'interrupted initialization recovery must leave pre-existing browsers unchanged');
+    const browsersAfter = chromeIdentities();
+    for (const browser of browsersBefore) {
+      assert.ok(browsersAfter.some(item => item.pid === browser.pid && item.startedAt === browser.startedAt && item.command === browser.command),
+        `interrupted initialization changed or terminated a pre-existing browser identity: ${browser.pid} ${browser.startedAt}`);
+    }
     assert.deepEqual(mcpProcessIDs(), mcpBefore, 'interrupted initialization recovery must release its MCP child');
     await rm(scratch, { recursive: true, force: true });
   }
@@ -298,7 +326,7 @@ async function oneCycle(index) {
   const sessionID = `phase4-smoke-${process.pid}-${index}-${Date.now()}`;
   const cleanupScratch = index === 7 ? await mkdtemp(path.join(os.tmpdir(), 'dex3js-cleanup-failure-')) : '';
   const cleanupFailureMarker = cleanupScratch ? path.join(cleanupScratch, 'refuse-once') : '';
-  const testArgs = index === 5 || index === 7 ? ['--test-session-mutations'] : [];
+  const testArgs = ['--test-browser-identity', ...(index === 5 || index === 7 ? ['--test-session-mutations'] : [])];
   const child = spawn(process.execPath, [helper, '--session-id', sessionID, '--headless', ...testArgs], {
     cwd: root,
     env: cleanupScratch ? { ...process.env, DEX3JS_TEST_CLEANUP_FAILURE_MARKER: cleanupFailureMarker } : process.env,
@@ -485,8 +513,11 @@ async function oneCycle(index) {
 
 await verifyBrowserFallbackGuard();
 await verifyPortCollisionHandling();
-await verifyInterruptedInitializationRecovery();
+for (let cycle = 1; cycle <= 10; cycle++) await verifyInterruptedInitializationRecovery(cycle);
 for (let index = 1; index <= sessionCount; index++) await oneCycle(index);
-const chromeAfter = chromeProcessIDs();
-assert.ok(chromeBefore.every(pid => chromeAfter.includes(pid)), 'the test must leave every pre-existing Chrome process alive');
+const chromeAfter = chromeIdentities();
+for (const browser of chromeBefore) {
+  assert.ok(chromeAfter.some(item => item.pid === browser.pid && item.startedAt === browser.startedAt && item.command === browser.command),
+    `the test must leave pre-existing Chrome identity ${browser.pid} alive and unchanged`);
+}
 console.log(`PASS: ${completed}/${sessionCount} isolated browser sessions reused one target per session and released MCP, Chrome, CDP, and proxy resources`);

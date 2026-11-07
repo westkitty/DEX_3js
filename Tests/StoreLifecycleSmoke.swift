@@ -3,6 +3,7 @@ import Darwin
 
 @MainActor @main struct StoreLifecycleSmoke {
     static func main() async throws {
+        try await verifyTerminationHandshake()
         let fm = FileManager.default
         let baselineBrowsers = browserProcessIDs()
         let scratch = fm.temporaryDirectory.appendingPathComponent("dex3js-store-lifecycle-\(UUID().uuidString)", isDirectory: true)
@@ -96,6 +97,23 @@ import Darwin
         precondition(!fm.fileExists(atPath: recordURL.path), "Cancellation left a stale process record")
         progress("repeated-cancel-cleanup")
 
+        let shutdownStore = Store(settingsDirectory: settingsURL)
+        shutdownStore.start()
+        try await waitFor("application shutdown child startup") {
+            guard shutdownStore.processState.hasPrefix("Running"), loopbackIsReady(port: port) else { return false }
+            return shutdownStore.processLog.contains("FIXTURE_OUTPUT")
+        }
+        guard let shutdownOwnership = try processRecord(at: settingsURL) else {
+            throw SmokeFailure.assertion("Application-shutdown fixture has no process record")
+        }
+        let shutdownClean = await withCheckedContinuation { continuation in
+            shutdownStore.shutdown { clean in continuation.resume(returning: clean) }
+        }
+        precondition(shutdownClean, "Store shutdown did not report successful owned-process cleanup")
+        precondition(!groupHasActiveMember(shutdownOwnership.pgid), "Application shutdown left its managed process group running")
+        precondition(!fm.fileExists(atPath: recordURL.path), "Application shutdown left a stale process record")
+        progress("application-shutdown-cleanup")
+
         let afterStop = Store(settingsDirectory: settingsURL)
         precondition(afterStop.processState == "Stopped", "Fresh Store did not report the intentionally stopped managed child")
 
@@ -147,6 +165,55 @@ import Darwin
         let chromeAfter = browserProcessIDs()
         precondition(chromeAfter == baselineBrowsers, "Store lifecycle test unexpectedly changed Chrome processes")
         print("PASS: production Store persistence/recovery, fresh-instance process revalidation, stale/unrelated PID rejection, repeated cancellation, output, timeout cleanup, exit status, and browser preservation")
+    }
+
+    private static func verifyTerminationHandshake() async throws {
+        let handshake = TerminationHandshake(timeout: 0.08)
+        var shutdownCalls = 0
+        var complete: ((Bool) -> Void)?
+        var replies: [Bool] = []
+        let shutdown: (@escaping (Bool) -> Void) -> Void = { callback in shutdownCalls += 1; complete = callback }
+        precondition(!handshake.request(shutdown: shutdown, reply: { replies.append($0) }), "first Quit must defer while cleanup runs")
+        precondition(!handshake.request(shutdown: shutdown, reply: { replies.append($0) }), "repeated Quit must await the same cleanup")
+        precondition(shutdownCalls == 1, "repeated Quit started duplicate cleanup")
+        complete?(true)
+        try await Task.sleep(nanoseconds: 30_000_000)
+        precondition(replies == [true, true], "successful cleanup did not resolve each pending Quit exactly once")
+        complete?(false)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        precondition(replies == [true, true], "duplicate cleanup completion sent a duplicate AppKit reply")
+        precondition(handshake.request(shutdown: shutdown, reply: { replies.append($0) }), "a completed clean shutdown must allow AppKit to terminate immediately")
+        precondition(shutdownCalls == 1, "completed termination unexpectedly restarted cleanup")
+
+        let retryHandshake = TerminationHandshake(timeout: 1)
+        var retryReplies: [Bool] = []
+        var attempt = 0
+        let retry: (@escaping (Bool) -> Void) -> Void = { callback in
+            attempt += 1
+            callback(attempt > 1)
+        }
+        precondition(!retryHandshake.request(shutdown: retry, reply: { retryReplies.append($0) }), "initial cleanup error must defer then report failure")
+        try await Task.sleep(nanoseconds: 20_000_000)
+        precondition(retryReplies == [false], "cleanup error was not returned to AppKit")
+        precondition(!retryHandshake.request(shutdown: retry, reply: { retryReplies.append($0) }), "a failed cleanup may be retried")
+        try await Task.sleep(nanoseconds: 20_000_000)
+        precondition(retryReplies == [false, true] && attempt == 2, "cleanup retry did not finish exactly once")
+
+        let timeoutHandshake = TerminationHandshake(timeout: 0.03)
+        var timeoutCalls = 0
+        var late: ((Bool) -> Void)?
+        var timeoutReplies: [Bool] = []
+        let delayed: (@escaping (Bool) -> Void) -> Void = { callback in timeoutCalls += 1; late = callback }
+        precondition(!timeoutHandshake.request(shutdown: delayed, reply: { timeoutReplies.append($0) }), "timed cleanup must defer the Quit request")
+        try await Task.sleep(nanoseconds: 60_000_000)
+        precondition(timeoutReplies == [false], "cleanup timeout must decline termination")
+        precondition(!timeoutHandshake.request(shutdown: delayed, reply: { timeoutReplies.append($0) }), "Quit during timed-out cleanup must not launch duplicate work")
+        precondition(timeoutCalls == 1 && timeoutReplies == [false, false], "timed-out cleanup retry was unsafe or unreported")
+        late?(true)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        precondition(timeoutHandshake.request(shutdown: delayed, reply: { timeoutReplies.append($0) }), "late successful cleanup should permit a later Quit without repeating cleanup")
+        precondition(timeoutCalls == 1, "late completion started duplicate cleanup")
+        print("PASS: native termination handshake coalesces repeated Quit, ignores duplicate completions, reports errors/timeouts, and permits safe retry")
     }
 
     private static func progress(_ value: String) {

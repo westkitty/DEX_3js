@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import Darwin
+import os
 
 struct Project: Identifiable, Codable, Hashable {
     var id = UUID()
@@ -297,6 +298,18 @@ private struct ProjectProcessRecord: Decodable {
         guard let data = try? Data(contentsOf: processRecord), let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any], (record["pid"] as? NSNumber)?.int32Value == pid else { return }
         try? FileManager.default.removeItem(at: processRecord)
     }
+    nonisolated private static func processGroupHasActiveMembers(_ group: Int32) -> Bool {
+        let task = Process(); task.executableURL = URL(fileURLWithPath: "/bin/ps"); task.arguments = ["-axo", "pid=,pgid=,stat="]
+        let output = Pipe(); task.standardOutput = output; task.standardError = FileHandle.nullDevice
+        guard (try? task.run()) != nil else { return true }
+        task.waitUntilExit()
+        guard task.terminationStatus == 0,
+              let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) else { return true }
+        return text.split(separator: "\n").contains { line in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            return fields.count >= 3 && fields[1] == Substring(String(group)) && !fields[2].contains("Z")
+        }
+    }
     private func verifiedProjectProcessRecord() -> ProjectProcessRecord? {
         guard let data = try? Data(contentsOf: processRecord),
               let record = try? JSONDecoder().decode(ProjectProcessRecord.self, from: data),
@@ -327,15 +340,60 @@ private struct ProjectProcessRecord: Decodable {
         guard path.withCString({ realpath($0, &buffer) }) != nil else { return nil }
         return String(cString: buffer)
     }
-    func stop() {
-        if sceneSessionActive { disconnectScene() }
+    func stop(disconnectInspector: Bool = true, completion: ((Bool) -> Void)? = nil) {
+        if disconnectInspector && sceneSessionActive && sceneStatus != "Disconnecting" { disconnectScene() }
         let ownedGroup: Int32
         if let p = process, p.isRunning { ownedGroup = p.processIdentifier }
         else if let recovered = verifiedProjectProcessRecord(), recovered.pid == recoveredProcessPID { ownedGroup = recovered.pgid }
-        else { message = "No verified DEX-owned project process is available to stop"; processState = "Stopped · ownership could not be verified"; return }
-        guard Darwin.getpgid(ownedGroup) == ownedGroup else { message = "Project process group identity changed; no signal was sent"; return }
+        else {
+            let noManagedProcess = process == nil && recoveredProcessPID == nil
+            message = "No verified DEX-owned project process is available to stop"
+            processState = noManagedProcess ? "Stopped · ownership could not be verified" : processState
+            completion?(noManagedProcess); return
+        }
+        guard Darwin.getpgid(ownedGroup) == ownedGroup else { message = "Project process group identity changed; no signal was sent"; completion?(false); return }
         _ = Darwin.kill(-ownedGroup, SIGTERM); processState = "Stopping…"; message = "Sent graceful stop to verified DEX-owned process group"
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { if Darwin.kill(-ownedGroup, 0) == 0 { _ = Darwin.kill(-ownedGroup, SIGKILL) }; Task { @MainActor in self.clearProcessRecord(pid: ownedGroup); self.process = nil; self.recoveredProcessPID = nil; self.processState = "Stopped" } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+            if Self.processGroupHasActiveMembers(ownedGroup), Darwin.getpgid(ownedGroup) == ownedGroup { _ = Darwin.kill(-ownedGroup, SIGKILL) }
+            let deadline = Date().addingTimeInterval(2)
+            while Self.processGroupHasActiveMembers(ownedGroup) && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+            let cleaned = !Self.processGroupHasActiveMembers(ownedGroup)
+            Task { @MainActor in
+                self.process = nil
+                if cleaned {
+                    self.clearProcessRecord(pid: ownedGroup); self.recoveredProcessPID = nil; self.processState = "Stopped"
+                } else {
+                    self.recoveredProcessPID = ownedGroup; self.processState = "Cleanup unverified"
+                    self.message = "The owned project group remains active; its process record was preserved. Retry Stop after reviewing ownership."
+                }
+                completion?(cleaned)
+            }
+        }
+    }
+    func shutdown(completion: @escaping (Bool) -> Void) {
+        let group = DispatchGroup()
+        var cleanupSucceeded = true
+        TerminationHandshake.record("shutdown begins project=\(processState) inspector=\(sceneSessionActive)")
+        if sceneSessionActive {
+            group.enter()
+            TerminationHandshake.record("inspector cleanup begins")
+            disconnectScene { closed in
+                TerminationHandshake.record("inspector cleanup finished clean=\(closed)")
+                cleanupSucceeded = cleanupSucceeded && closed
+                group.leave()
+            }
+        }
+        group.enter()
+        TerminationHandshake.record("managed-project cleanup begins")
+        stop(disconnectInspector: false) { stopped in
+            TerminationHandshake.record("managed-project cleanup finished clean=\(stopped)")
+            cleanupSucceeded = cleanupSucceeded && stopped
+            group.leave()
+        }
+        group.notify(queue: .main) {
+            TerminationHandshake.record("shutdown resolved clean=\(cleanupSucceeded)")
+            completion(cleanupSucceeded)
+        }
     }
     func openURL(_ value: String) { guard let url = URL(string: value) else { return }; NSWorkspace.shared.open(url) }
     func openFolder() { guard let p = selected else { return }; NSWorkspace.shared.open(URL(fileURLWithPath: p.path)) }
@@ -724,7 +782,7 @@ private struct ProjectProcessRecord: Decodable {
     private func finishOwnedSceneGroupCleanup(group: Int32, completion: ((Bool) -> Void)?) {
         guard group > 0 else { completion?(true); return }
         DispatchQueue.global().async { [weak self] in
-            func exists() -> Bool { Darwin.kill(-group, 0) == 0 || errno == EPERM }
+            func exists() -> Bool { Self.processGroupHasActiveMembers(group) }
             let gracefulDeadline = Date().addingTimeInterval(5)
             while exists() && Date() < gracefulDeadline { Thread.sleep(forTimeInterval: 0.1) }
             if exists() { _ = Darwin.kill(-group, SIGTERM) }
@@ -801,11 +859,87 @@ private struct ProjectProcessRecord: Decodable {
     }
 }
 extension JSONEncoder { static var pretty: JSONEncoder { let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]; return e } }
+@MainActor final class TerminationHandshake {
+    private enum Phase { case idle, pending(UInt64), timedOut(UInt64), complete }
+    private var phase: Phase = .idle
+    private var nextID: UInt64 = 0
+    private var replies: [(Bool) -> Void] = []
+    private let timeout: TimeInterval
+
+    init(timeout: TimeInterval = 20) { self.timeout = timeout }
+
+    /// Returns true only when a previous cleanup completed successfully.
+    @discardableResult
+    func request(shutdown: (@escaping (Bool) -> Void) -> Void, reply: @escaping (Bool) -> Void) -> Bool {
+        if case .complete = phase { return true }
+        if case .timedOut = phase {
+            reply(false)
+            return false
+        }
+        replies.append(reply)
+        if case .pending = phase {
+        Self.record("duplicate quit queued")
+            return false
+        }
+
+        nextID &+= 1
+        let id = nextID
+        phase = .pending(id)
+        Self.record("quit requested; shutdown #\(id) began")
+        shutdown { [weak self] clean in
+            Task { @MainActor in self?.finish(id: id, clean: clean, timedOut: false) }
+        }
+        let deadline = timeout
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+            self?.finish(id: id, clean: false, timedOut: true)
+        }
+        return false
+    }
+
+    private func finish(id: UInt64, clean: Bool, timedOut: Bool) {
+        switch phase {
+        case .pending(let activeID) where activeID == id:
+            phase = timedOut ? .timedOut(id) : (clean ? .complete : .idle)
+            let pendingReplies = replies
+            replies.removeAll()
+            Self.record(timedOut ? "shutdown #\(id) exceeded \(timeout)s; AppKit termination declined" : "shutdown #\(id) completed clean=\(clean)")
+            pendingReplies.forEach { $0(clean && !timedOut) }
+        case .timedOut(let activeID) where activeID == id:
+            phase = clean ? .complete : .idle
+            Self.record("late shutdown #\(id) completion clean=\(clean)")
+        default:
+            Self.record("duplicate or stale shutdown #\(id) completion ignored")
+        }
+    }
+
+    static func record(_ event: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        Logger(subsystem: "com.westkitty.dex3js", category: "termination").info("DEX_TERMINATION \(stamp, privacy: .public) pid=\(getpid(), privacy: .public) \(event, privacy: .public)")
+    }
+}
 #if !DEX3JS_TESTING
+@MainActor final class DEX3jsApplicationDelegate: NSObject, NSApplicationDelegate {
+    var store: Store?
+    private let termination = TerminationHandshake()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        TerminationHandshake.record("AppKit termination delegate invoked")
+        guard let store else { return .terminateNow }
+        let alreadyClean = termination.request(shutdown: { [store] completion in
+            TerminationHandshake.record("AppKit deferred termination accepted; managed shutdown entered")
+            store.shutdown(completion: completion)
+        }, reply: { clean in
+            TerminationHandshake.record("AppKit termination reply clean=\(clean)")
+            sender.reply(toApplicationShouldTerminate: clean)
+        })
+        return alreadyClean ? .terminateNow : .terminateLater
+    }
+}
 @main struct DEX3jsApp: App {
+    @NSApplicationDelegateAdaptor(DEX3jsApplicationDelegate.self) private var appDelegate
     @StateObject private var store = Store()
     init() { DEXAppearance.applyToApplication() }
-    var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(DEXAppearance.colorScheme).onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in store.cancelInspection(); store.stop() } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
+    var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(DEXAppearance.colorScheme).onAppear { appDelegate.store = store } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
 }
 #endif
 
