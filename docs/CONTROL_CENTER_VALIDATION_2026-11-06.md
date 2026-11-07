@@ -216,4 +216,4 @@ This test exposed two defects in Store restart validation: `ps lstart` was split
 
 **UNVERIFIED / PENDING:** Actual DEX-owned browser and Needle Inspector panel; VoiceOver and real keyboard-focus behavior; and full installed-app restart/reattachment under the normal project shutdown contract. Those three human-observed journeys remain in `docs/HEADLESS_HARDENING_ACCEPTANCE.md`. No app installation or release was made.
 
-**Git:** The reviewed hardening files are staged on `feat/dex3js-headless-hardening`; the commit and push are the remaining delivery steps in this closure. No merge to main or release is part of this closure.
+**Git delivery:** The reviewed hardening change set was committed as `ef047bf2afb5c76bd5d65bbb6c1fec29c6268aaa`, pushed to `origin/feat/dex3js-headless-hardening`, and independently read back at the same local, tracking and remote SHA. A documentation-only append records that delivery closure; no merge to main or release is part of this work.
