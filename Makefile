@@ -7,6 +7,7 @@ build:
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
 	swiftc -swift-version 5 -parse-as-library -framework SwiftUI -framework AppKit $(SOURCES) -o "$(BIN)"
 	cp Resources/Info.plist "$(APP)/Contents/Info.plist"
+	cp Resources/scene-bridge.mjs "$(APP)/Contents/Resources/scene-bridge.mjs"
 
 install: build
 	mkdir -p "$(HOME)/Applications" "$(HOME)/.local/bin"
@@ -18,6 +19,7 @@ run: build
 	open -n "$(APP)"
 
 test:
+	node --check Resources/scene-bridge.mjs
 	swiftc -swift-version 5 -parse-as-library -framework SwiftUI -framework AppKit -typecheck $(SOURCES)
 	swiftc -swift-version 5 Sources/DEX3js/ToolRuntime.swift Tests/ControlCenterSmoke.swift -o /tmp/dex3js-control-center-smoke
 	/tmp/dex3js-control-center-smoke

@@ -17,6 +17,7 @@ enum ProbeState: String {
     case unknown = "Not checked"
     case checking = "Checking"
     case ready = "Reachable"
+    case connected = "Connected"
     case disconnected = "Awaiting scene"
     case stopped = "Unavailable"
     case blocked = "Invalid endpoint"
@@ -60,7 +61,7 @@ enum ToolProbe {
                 return ProbeObservation(state: .disconnected, detail: "Bridge replied, scene status unverified")
             }
             return connected
-                ? ProbeObservation(state: .ready, detail: "Live Three.js browser scene connected")
+                ? ProbeObservation(state: .connected, detail: "Live Three.js browser scene connected")
                 : ProbeObservation(state: .disconnected, detail: "MCP bridge running; browser scene not connected")
         } catch {
             return ProbeObservation(state: .stopped, detail: "Local service is not responding")

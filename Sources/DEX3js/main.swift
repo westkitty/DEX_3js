@@ -21,6 +21,35 @@ struct Settings: Codable { var version = 1; var projects: [Project] = []; var pr
 struct ProjectProfile: Codable { var version: Int; var name: String; var url: String?; var actions: [ProfileAction] }
 struct ProfileAction: Codable { var name: String; var path: String }
 
+struct SceneNode: Identifiable, Hashable {
+    var id: String { path }
+    let path, name, type, summary: String
+    let reportedChildCount: Int?
+    let canInspect: Bool
+    let selectionDisabledReason: String?
+    let children: [SceneNode]
+    var nodeCount: Int { 1 + children.reduce(0) { $0 + $1.nodeCount } }
+    init(_ value: [String: Any], path parent: String = "", parentCanBeAddressed: Bool = true) {
+        type = value["type"] as? String ?? "Object"
+        let rawName = (value["name"] as? String).flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        let canAddress = parentCanBeAddressed && rawName != nil
+        name = rawName ?? "(unnamed \(type))"
+        reportedChildCount = value["childCount"] as? Int
+        canInspect = canAddress
+        selectionDisabledReason = rawName == nil
+            ? "The installed scene bridge provides no name or stable identifier for this object."
+            : (!parentCanBeAddressed ? "An ancestor has no addressable MCP path, so this object cannot be selected." : nil)
+        let nodePath = parent.isEmpty ? name : "\(parent).\(name)"
+        path = nodePath
+        let fields = value.filter { !["name", "type", "children"].contains($0.key) }
+        summary = fields.keys.sorted().compactMap { key in
+            guard let data = try? JSONSerialization.data(withJSONObject: fields[key] as Any, options: [.fragmentsAllowed, .sortedKeys]), let text = String(data: data, encoding: .utf8) else { return nil }
+            return "\(key): \(text)"
+        }.joined(separator: "\n")
+        children = (value["children"] as? [[String: Any]] ?? []).map { SceneNode($0, path: nodePath, parentCanBeAddressed: canAddress) }
+    }
+}
+
 @MainActor final class Store: ObservableObject {
     @Published var settings: Settings
     @Published var selectedID: UUID?
@@ -34,9 +63,26 @@ struct ProfileAction: Codable { var name: String; var path: String }
     @Published var lastCheckedAt: Date?
     @Published var inspectionOutput = ""
     @Published var inspecting = false
-    private var inspectionProcess: Process?
-    private var inspectionPipe: Pipe?
-    private var inspectionProject = ""
+    @Published var sceneNodes: [SceneNode] = []
+    @Published var selectedScenePath = ""
+    @Published var objectDetails = ""
+    @Published var pendingChanges = ""
+    @Published var previewProperty = "roughness"
+    @Published var previewValue = "0.35"
+    @Published var sceneStatus = "Disconnected"
+    @Published var sceneSnapshotProject = ""
+    private var sceneProcess: Process?
+    private var sceneInput: Pipe?
+    private var sceneBuffer = Data()
+    private var nextSceneCommand = 0
+    private var sceneCompletions: [Int: (Result<Any, Error>) -> Void] = [:]
+    var sceneConnected: Bool { sceneProcess != nil }
+    var pendingChangeIDs: [Int] {
+        let pattern = #"#(\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(pendingChanges.startIndex..., in: pendingChanges)
+        return Array(Set(regex.matches(in: pendingChanges, range: range).compactMap { match in Range(match.range(at: 1), in: pendingChanges).flatMap { Int(pendingChanges[$0]) } })).sorted()
+    }
     private var probeSequence = UUID()
     private var process: Process?
     private var logPipe: Pipe?
@@ -82,11 +128,12 @@ struct ProfileAction: Codable { var name: String; var path: String }
     func removeSelected() { guard let p = selected else { return }; guard process == nil else { message = "Stop the managed project before removing it"; return }; settings.projects.removeAll { $0.id == p.id }; selectedID = settings.projects.first?.id; serverURL = ""; processLog = ""; processState = "Stopped"; save() }
     func selectProject(_ id: UUID?) {
         guard process == nil || id == selectedID else { message = "Stop the managed project before switching projects"; return }
-        guard !inspecting || id == selectedID else { message = "Finish or cancel scene inspection before switching projects"; return }
+            guard !inspecting || id == selectedID else { message = "Disconnect scene inspector before switching projects"; return }
         if selectedID != id {
             selectedID = id; serverURL = ""; processLog = ""; processState = "Stopped"
             probeSequence = UUID(); health = [:]; lastCheckedAt = nil
-            inspectionOutput = ""; inspectionProject = ""
+            pendingChanges = ""; disconnectScene(); selectedScenePath = ""
+            if !sceneSnapshotProject.isEmpty { sceneStatus = "Disconnected · cached snapshot: \(sceneSnapshotProject)" }
             message = "Project selected"
             isCheckingTools = false
             refreshHealth()
@@ -129,7 +176,20 @@ struct ProfileAction: Codable { var name: String; var path: String }
         let pipe = Pipe(); task.standardOutput = pipe; task.standardError = pipe; logPipe = pipe
         pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let bytes = h.availableData; guard !bytes.isEmpty, let text = String(data: bytes, encoding: .utf8) else { return }
-            Task { @MainActor in self?.processLog = String((self?.processLog ?? "") + text.suffix(3000)); if let match = text.range(of: #"https?://(?:localhost|127\.0\.0\.1):\d+[^\s]*"#, options: .regularExpression) { self?.serverURL = String(text[match]) } }
+            Task { @MainActor in
+                guard let self else { return }
+                self.processLog = String(self.processLog + text.suffix(3000))
+                if let match = text.range(of: #"https?://(?:localhost|127\.0\.0\.1):\d+[^\s]*"#, options: .regularExpression) {
+                    let capturedURL = String(text[match])
+                    if self.serverURL != capturedURL {
+                        self.serverURL = capturedURL
+                        // If the initial probe is already running, its completion notices
+                        // the changed endpoint and repeats against this URL. Otherwise,
+                        // begin probing as soon as the dev server announces it.
+                        self.refreshHealth()
+                    }
+                }
+            }
         }
         task.terminationHandler = { [weak self] proc in
             // Foundation launched npm into a dedicated process group (PGID == its PID).
@@ -172,7 +232,6 @@ struct ProfileAction: Codable { var name: String; var path: String }
             message = "Studio launch requested; refresh connections to confirm readiness"
         } catch { message = "Studio launch failed: \(error.localizedDescription)" }
     }
-
     // Explicit, bounded local probes: an installed or registered MCP is not a live connection.
     func refreshHealth() {
         guard !isCheckingTools else { return }
@@ -198,7 +257,18 @@ struct ProfileAction: Codable { var name: String; var path: String }
                 "studioWeb": web
             ]
             guard let self, self.probeSequence == token else { return }
-            self.health = resolved
+            if !self.serverURL.isEmpty, selectedURL != self.serverURL {
+                self.isCheckingTools = false
+                self.refreshHealth()
+                return
+            }
+            var observations = resolved
+            if self.sceneProcess != nil {
+                observations["bridge"] = self.sceneStatus == "Connected · scene loaded"
+                    ? ProbeObservation(state: .connected, detail: "DEX DevTools MCP confirmed the live browser scene")
+                    : ProbeObservation(state: .disconnected, detail: "DEX DevTools MCP session active; waiting for a readable browser scene")
+            }
+            self.health = observations
             self.lastCheckedAt = Date()
             self.isCheckingTools = false
             self.message = "Local connection check completed"
@@ -243,75 +313,110 @@ struct ProfileAction: Codable { var name: String; var path: String }
         message = "Requested Chrome opening; enable Needle Inspector from its extension toolbar"
     }
     func inspectScene() {
-        guard !inspecting else { message = "An inspection is already running"; return }
         guard let project = selected, project.trusted else {
             message = "Select a trusted project before launching its inspector"; return
         }
+        guard process != nil else { message = "Start this trusted project from DEX before connecting the scene inspector"; return }
         guard FileManager.default.fileExists(atPath: URL(fileURLWithPath: project.path).appendingPathComponent("package.json").path) else {
             message = "Project package.json is missing"; return
         }
-        let lab = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".local/bin/3d-lab")
-        guard FileManager.default.isExecutableFile(atPath: lab.path) else {
-            message = "Shared 3d-lab inspector is missing"; return
+        guard let localURL = LocalEndpoint.validated(serverURL.isEmpty ? project.url ?? "" : serverURL) else { sceneStatus = "Unavailable"; message = "DEX has not measured a local project URL yet. Wait for the server URL, then retry."; return }
+        guard let node = ["/opt/homebrew/bin/node", "/usr/local/bin/node"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { sceneStatus = "Unavailable"; message = "Node.js is missing; repair the installed 3d-lab toolkit."; return }
+        guard let helper = Bundle.main.resourceURL?.appendingPathComponent("scene-bridge.mjs"), FileManager.default.fileExists(atPath: helper.path) else { sceneStatus = "Unavailable"; message = "Scene bridge helper is missing; rebuild DEX."; return }
+        if sceneProcess == nil {
+            let task = Process(); task.executableURL = URL(fileURLWithPath: node); task.arguments = [helper.path]
+            task.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": NSHomeDirectory()]
+            let output = Pipe(); let input = Pipe(); task.standardOutput = output; task.standardInput = input; task.standardError = FileHandle.nullDevice
+            sceneInput = input; sceneBuffer = Data()
+            output.fileHandleForReading.readabilityHandler = { [weak self] handle in let chunk = handle.availableData; guard !chunk.isEmpty else { return }; Task { @MainActor in self?.consumeSceneOutput(chunk) } }
+            task.terminationHandler = { [weak self] _ in Task { @MainActor in
+                self?.sceneProcess = nil; self?.sceneInput = nil; self?.inspecting = false
+                self?.sceneStatus = self?.sceneSnapshotProject.isEmpty == false ? "Disconnected · cached snapshot: \(self?.sceneSnapshotProject ?? "")" : "Disconnected"
+                self?.health["bridge"] = ProbeObservation(state: .disconnected, detail: "DEX scene inspector disconnected; reconnect to confirm the browser scene")
+            } }
+            do { try task.run(); sceneProcess = task } catch { sceneStatus = "Unavailable"; health["bridge"] = ProbeObservation(state: .stopped, detail: "Could not start DEX scene helper"); message = "Could not start scene bridge: \(error.localizedDescription)"; return }
         }
-        let task = Process()
-        task.executableURL = lab
-        task.arguments = ["inspect", "--project", project.path]
-        task.currentDirectoryURL = URL(fileURLWithPath: project.path)
-        task.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": NSHomeDirectory()]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-        inspectionPipe = pipe
-        inspectionOutput = "Connecting to real Three.js scene…\n"
-        inspectionProject = project.path
-        inspecting = true
-        let expectedPath = project.path
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let chunk = handle.availableData
-            guard !chunk.isEmpty, let string = String(data: chunk, encoding: .utf8) else { return }
-            Task { @MainActor in
-                guard let self, self.inspectionProject == expectedPath else { return }
-                self.inspectionOutput = String((self.inspectionOutput + string).suffix(24000))
+        inspectionOutput = "Connecting to the real Three.js scene…"; inspecting = true; sceneStatus = "Connecting"
+        health["bridge"] = ProbeObservation(state: .disconnected, detail: "DEX DevTools MCP session is connecting")
+        message = "Starting persistent DevTools MCP session"
+        sendScene("connect", ["project": project.path, "url": localURL.absoluteString]) { [weak self] result in
+            guard let self else { return }; switch result {
+            case .success:
+                self.sceneStatus = "Connected · awaiting browser scene"
+                self.health["bridge"] = ProbeObservation(state: .disconnected, detail: "MCP session ready; the browser scene is not confirmed yet")
+                self.refreshScene()
+            case .failure(let error):
+                self.inspecting = false; self.sceneStatus = "Error"
+                self.health["bridge"] = ProbeObservation(state: .stopped, detail: "DEX MCP connection failed")
+                self.inspectionOutput = error.localizedDescription
+                self.message = "Scene connection failed. Start the project and open a browser view, then retry."
             }
-        }
-        task.terminationHandler = { [weak self] process in
-            Task { @MainActor in
-                guard let self else { return }
-                self.inspectionPipe?.fileHandleForReading.readabilityHandler = nil
-                self.inspectionPipe = nil
-                self.inspectionProcess = nil
-                self.inspecting = false
-                if process.terminationStatus == 0 {
-                    self.message = "Scene inspection returned; source files untouched"
-                } else {
-                    self.message = "Scene inspection stopped or failed (exit \(process.terminationStatus)); see output"
-                }
-            }
-        }
-        do {
-            try task.run()
-            inspectionProcess = task
-            message = "Inspecting live project scene"
-        } catch {
-            pipe.fileHandleForReading.readabilityHandler = nil
-            inspectionPipe = nil
-            inspecting = false
-            inspectionProcess = nil
-            inspectionOutput += "Failed to start: \(error.localizedDescription)"
-            message = "Scene inspector could not start"
         }
     }
-    func cancelInspection() {
-        guard let current = inspectionProcess, current.isRunning else { return }
-        let pid = current.processIdentifier
-        // Signal the launcher-owned process group only if the OS confirms ownership.
-        if Darwin.getpgid(pid) == pid {
-            _ = Darwin.kill(-pid, SIGTERM)
-        } else {
-            current.terminate()
+    func refreshScene() {
+        guard sceneProcess != nil else { inspectScene(); return }
+        inspecting = true; sceneStatus = "Loading scene"; message = "Reading live scene hierarchy"
+        sendScene("tree") { [weak self] result in
+            guard let self else { return }; self.inspecting = false
+            switch result {
+            case .success(let value):
+                guard let root = value as? [String: Any] else { self.sceneStatus = "Empty scene"; self.sceneNodes = []; return }
+                self.sceneNodes = [SceneNode(root)]; self.sceneSnapshotProject = self.selected?.name ?? "selected project"; self.selectedScenePath = self.sceneNodes.first?.path ?? ""; self.sceneStatus = self.sceneNodes.isEmpty ? "Empty scene" : "Connected · scene loaded"
+                self.health["bridge"] = self.sceneNodes.isEmpty
+                    ? ProbeObservation(state: .disconnected, detail: "The MCP returned an empty scene")
+                    : ProbeObservation(state: .connected, detail: "DEX DevTools MCP confirmed the live browser scene")
+                self.inspectionOutput = "Loaded \(self.sceneNodes.first?.nodeCount ?? 0) scene nodes from the live MCP response for \(self.sceneSnapshotProject). Large groups are capped per response."
+                self.message = "Live scene refreshed; project source untouched"
+                if !self.selectedScenePath.isEmpty { self.selectSceneObject(self.selectedScenePath) }
+            case .failure(let error): self.sceneStatus = "Error"; self.health["bridge"] = ProbeObservation(state: .disconnected, detail: "MCP is running but scene_tree did not return a scene"); self.inspectionOutput = error.localizedDescription; self.message = "Scene read failed. Check the connection and local browser scene."
+            }
         }
-        message = "Cancel requested for the selected inspection process"
+    }
+    func selectSceneObject(_ path: String) {
+        selectedScenePath = path
+        sendScene("details", ["path": path]) { [weak self] result in guard let self else { return }; switch result { case .success(let value): self.objectDetails = Self.pretty(value); case .failure(let error): self.objectDetails = error.localizedDescription } }
+    }
+    func previewSceneChange() {
+        guard let value = Double(previewValue), value.isFinite, ["roughness", "metalness", "opacity", "emissiveIntensity"].contains(previewProperty) else { message = "Choose a supported finite numeric material value"; return }
+        if previewProperty == "emissiveIntensity", value < 0 { message = "Emissive intensity must be zero or greater"; return }
+        if ["roughness", "metalness", "opacity"].contains(previewProperty), !(0...1).contains(value) { message = "\(previewProperty) must be between 0 and 1"; return }
+        let name = selectedScenePath.components(separatedBy: ".").last ?? selectedScenePath
+        sendScene("preview", ["tool": "set_material_property", "params": ["name": name, "property": previewProperty, "value": value]]) { [weak self] result in guard let self else { return }; switch result { case .success(let response): self.message = "Temporary browser preview applied; source files unchanged. \(Self.pretty(response))"; self.loadPendingChanges(); case .failure(let error): self.message = "Preview failed: \(error.localizedDescription)" } }
+    }
+    func loadPendingChanges() { sendScene("pending") { [weak self] result in guard let self else { return }; switch result { case .success(let value): self.pendingChanges = Self.pretty(value); case .failure(let error): self.pendingChanges = error.localizedDescription } } }
+    func revertSceneChange(_ id: Int? = nil) {
+        var args: [String: Any] = [:]; if let id { args["ids"] = [id] }
+        sendScene("revert", args) { [weak self] result in guard let self else { return }; switch result { case .success(let value): self.message = "Temporary change reverted: \(Self.pretty(value))"; self.loadPendingChanges(); case .failure(let error): self.message = "Revert failed: \(error.localizedDescription)" } }
+    }
+    func sendScene(_ op: String, _ args: [String: Any] = [:], completion: @escaping (Result<Any, Error>) -> Void) {
+        guard let input = sceneInput else { completion(.failure(NSError(domain: "DEXScene", code: 1, userInfo: [NSLocalizedDescriptionKey: "Inspector is disconnected"]))); return }
+        nextSceneCommand += 1; let id = nextSceneCommand; sceneCompletions[id] = completion
+        do { let data = try JSONSerialization.data(withJSONObject: ["id": id, "op": op, "args": args], options: [.fragmentsAllowed, .sortedKeys]); input.fileHandleForWriting.write(data + Data([10])) }
+        catch { sceneCompletions.removeValue(forKey: id)?(.failure(error)) }
+    }
+    private func consumeSceneOutput(_ data: Data) {
+        sceneBuffer.append(data)
+        while let newline = sceneBuffer.firstIndex(of: 10) {
+            let line = sceneBuffer.prefix(upTo: newline); sceneBuffer.removeSubrange(...newline)
+            guard let item = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            if item["event"] as? String == "ready" { sceneStatus = "Connected · Three.js DevTools MCP"; continue }
+            guard let id = item["id"] as? Int, let completion = sceneCompletions.removeValue(forKey: id) else { continue }
+            if item["ok"] as? Bool == true { completion(.success(item["result"] ?? NSNull())) }
+            else { completion(.failure(NSError(domain: "DEXScene", code: 2, userInfo: [NSLocalizedDescriptionKey: item["error"] as? String ?? "MCP request failed"]))) }
+        }
+    }
+    func disconnectScene() {
+        guard let task = sceneProcess else { return }
+        sceneInput?.fileHandleForWriting.write(Data("{\"op\":\"close\"}\n".utf8)); inspecting = false; sceneStatus = "Disconnecting"
+        health["bridge"] = ProbeObservation(state: .disconnected, detail: "DEX scene inspector is disconnecting")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { if task.isRunning { task.terminate() } }
+    }
+    private static func pretty(_ value: Any) -> String { guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys, .fragmentsAllowed]) else { return String(describing: value) }; return String(data: data, encoding: .utf8) ?? String(describing: value) }
+    func cancelInspection() {
+        disconnectScene(); pendingChanges = ""
+        if !sceneSnapshotProject.isEmpty { sceneStatus = "Disconnecting · cached snapshot: \(sceneSnapshotProject)" }
+        if sceneProcess == nil { health["bridge"] = ProbeObservation(state: .disconnected, detail: "DEX scene inspector is disconnected") }
+        message = "Inspector disconnected; its browser session is closing. The last scene snapshot remains viewable."
     }
     func diagnostics() -> String {
         let tool = "~/.local/share/3d-lab"; let exists = FileManager.default.fileExists(atPath: NSString(string: tool).expandingTildeInPath)
@@ -336,7 +441,6 @@ struct ProfileAction: Codable { var name: String; var path: String }
     }
 }
 extension JSONEncoder { static var pretty: JSONEncoder { let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]; return e } }
-
 @main struct DEX3jsApp: App {
     @StateObject private var store = Store()
     var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(.light).onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in store.cancelInspection(); store.stop() } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
@@ -470,34 +574,38 @@ struct MainView: View {
     var inspectorPanel: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Read the actual Three.js scene tree through the installed DevTools MCP. This check does not change the project source.")
+                Text("Live hierarchy and object data come from the installed Three.js DevTools MCP. Preview changes live only in its browser session; they never edit project files.")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack {
                     Button(store.inspecting ? "Inspecting…" : "Inspect live scene") { store.inspectScene() }
                         .disabled(store.inspecting || store.selected == nil)
-                    if store.inspecting {
-                        Button("Cancel inspection") { store.cancelInspection() }
-                    }
-                    if !store.inspectionOutput.isEmpty {
-                        Button("Copy output") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(store.inspectionOutput, forType: .string)
-                        }
-                    }
+                    Button("Refresh scene") { store.refreshScene() }.disabled(!store.sceneConnected || store.inspecting)
+                    Button("Disconnect") { store.cancelInspection() }.disabled(!store.sceneConnected)
+                    Button("Copy details") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(store.objectDetails.isEmpty ? store.inspectionOutput : store.objectDetails, forType: .string) }.disabled(store.objectDetails.isEmpty && store.inspectionOutput.isEmpty)
+                    Text(store.sceneStatus).font(.caption.weight(.medium)).foregroundStyle(.secondary)
                 }
-                if !store.inspectionOutput.isEmpty {
-                    ScrollView {
-                        Text(store.inspectionOutput)
-                            .font(.system(size: 12, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                    }
-                    .frame(minHeight: 130, maxHeight: 310)
-                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                } else {
-                    Text("No inspection recorded this session. Start the project, then choose Inspect live scene.")
-                        .font(.caption).foregroundStyle(.secondary)
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("SCENE HIERARCHY").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        if store.sceneNodes.isEmpty { ContentUnavailableView(store.sceneStatus == "Error" ? "Scene unavailable" : "No scene loaded", systemImage: "square.3.layers.3d", description: Text(store.inspectionOutput.isEmpty ? "Start the project, open a browser view, and connect the inspector." : store.inspectionOutput)) }
+                        else { ScrollView { LazyVStack(alignment: .leading, spacing: 2) { ForEach(store.sceneNodes) { SceneNodeRow(node: $0) } }.frame(maxWidth: .infinity, alignment: .leading).padding(6) }.frame(minHeight: 240, maxHeight: 330).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7)) }
+                    }.frame(minWidth: 260, maxWidth: 340, alignment: .leading)
+                    Divider()
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("OBJECT INSPECTOR").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        Text(store.selectedScenePath.isEmpty ? "Select an object in the hierarchy" : store.selectedScenePath).font(.caption).textSelection(.enabled)
+                        ScrollView { Text(store.objectDetails.isEmpty ? "Select an object to read its properties." : store.objectDetails).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }.frame(minHeight: 180, maxHeight: 260).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+                        Text("TEMPORARY MATERIAL PREVIEW").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        HStack {
+                            Picker("Property", selection: $store.previewProperty) { ForEach(["roughness", "metalness", "opacity", "emissiveIntensity"], id: \.self) { Text($0).tag($0) } }.frame(width: 180)
+                            TextField("Numeric value", text: $store.previewValue).frame(width: 90)
+                            Button("Preview") { store.previewSceneChange() }.disabled(store.selectedScenePath.isEmpty || !store.sceneConnected)
+                            Button("Show pending") { store.loadPendingChanges() }.disabled(!store.sceneConnected)
+                            Button("Revert all") { store.revertSceneChange() }.disabled(!store.sceneConnected)
+                        }
+                        if !store.pendingChanges.isEmpty { ScrollView { VStack(alignment: .leading, spacing: 5) { Text(store.pendingChanges).font(.system(size: 10, design: .monospaced)).textSelection(.enabled); ForEach(store.pendingChangeIDs, id: \.self) { id in Button("Revert change #\(id)") { store.revertSceneChange(id) }.buttonStyle(.bordered) } }.frame(maxWidth: .infinity, alignment: .leading).padding(6) }.frame(maxHeight: 90).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7)) }
+                        Text("Preview requires a supported material on the selected object. Changes remain temporary in the browser and can be reverted here.").font(.caption2).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
                 }
             }.padding(7)
         } label: { Label("Live scene", systemImage: "square.3.layers.3d") }
@@ -514,6 +622,7 @@ struct MainView: View {
     func healthColor(_ state: ProbeState) -> Color {
         switch state {
         case .ready: return .green
+        case .connected: return .green
         case .checking: return .blue
         case .disconnected: return .orange
         case .blocked, .stopped: return .red
@@ -538,4 +647,39 @@ struct MainView: View {
     var toolRows: [(name:String,kind:String,state:String)] { [("Three.js DevTools MCP","MCP server","Installed · 0.5.0"),("Needle Inspector","Browser extension","Enabled · 2.9.0"),("Official Three.js DevTools","Browser development tool","Unverified"),("Chrome DevTools MCP","MCP server","Not installed"),("Spector.js MCP","MCP server","Not installed"),("Playwright CLI","Command-line tool","Unverified"),("Blender Lab MCP","MCP server","Not installed"),("glTF Transform","Asset pipeline","Unverified"),("glTF Validator","Asset validator","Unverified"),("AI Three.js Studio","Standalone app + MCP","Installed · fa2f5eb"),("Tweakpane","Project library","Not installed globally"),("Theatre.js","Project library","Not installed globally"),("Triplex","Project authoring tool","Unverified"),("Postprocessing","Project library","Not installed globally"),("three-mesh-bvh","Project library","Not installed globally")] }
     var diagnostics: some View { VStack(alignment: .leading, spacing: 12) { Text("Diagnostics").font(.title2.weight(.semibold)); Text(store.diagnostics()).font(.system(.body, design: .monospaced)).textSelection(.enabled); HStack { Button("Copy sanitized report") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(store.diagnostics(), forType: .string) }; Button("Open shared Studio") { store.studio() }; Button("Reload configuration") { store.reload() } } } }
     var configuration: some View { VStack(alignment: .leading, spacing: 12) { Text("Configuration").font(.title2.weight(.semibold)); Text("Settings: ~/Library/Application Support/DEX 3js/settings.json"); Text("Configuration is versioned JSON data, written atomically with a last known-good backup. It is not shell code.").foregroundStyle(.secondary); Text("Import and export project profiles as dex3js.json. External profile edits take effect with Reload dex3js.json; external settings edits take effect with Reload from disk."); Button("Open settings folder") { NSWorkspace.shared.open(URL(fileURLWithPath: NSString(string: "~/Library/Application Support/DEX 3js").expandingTildeInPath)) }; Button("Reload from disk") { store.reload() }; Button("Export settings") { let panel = NSSavePanel(); panel.nameFieldStringValue = "dex3js-settings.json"; if panel.runModal() == .OK, let url = panel.url, let d = try? JSONEncoder.pretty.encode(store.settings) { try? d.write(to: url, options: .atomic) } } } }
+}
+
+struct SceneNodeRow: View {
+    @EnvironmentObject var store: Store
+    let node: SceneNode
+    @State private var expanded: Bool
+    init(node: SceneNode) { self.node = node; _expanded = State(initialValue: node.path == node.name) }
+    var body: some View {
+        if node.children.isEmpty {
+            row
+        } else {
+            DisclosureGroup(isExpanded: $expanded) {
+                LazyVStack(alignment: .leading, spacing: 2) { ForEach(node.children) { child in SceneNodeRow(node: child).environmentObject(store) } }
+            } label: { row }
+        }
+    }
+    private var row: some View {
+        Button { store.selectSceneObject(node.path) } label: {
+            HStack(spacing: 6) {
+                Image(systemName: node.type.contains("Light") ? "lightbulb" : node.type == "Scene" ? "square.3.layers.3d" : "cube")
+                    .foregroundStyle(.secondary).frame(width: 14)
+                Text(node.name).lineLimit(1)
+                Text(node.type).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                if let reported = node.reportedChildCount, reported > node.children.count {
+                    Text("showing \(node.children.count) of \(reported)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }.padding(.vertical, 2).contentShape(Rectangle())
+                .background(store.selectedScenePath == node.path ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+        .disabled(!node.canInspect)
+        .accessibilityLabel(node.canInspect ? "\(node.name), \(node.type)" : "\(node.name). \(node.selectionDisabledReason ?? "Cannot inspect object.")")
+        .help(node.canInspect ? node.summary : (node.selectionDisabledReason ?? "Cannot inspect object."))
+    }
 }

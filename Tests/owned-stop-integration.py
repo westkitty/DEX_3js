@@ -27,16 +27,17 @@ with tempfile.TemporaryDirectory(prefix="dex3js-stop-smoke-") as tmp:
     log = open(root / "server.log", "w")
     proc = subprocess.Popen([npm, "run", "dev", "--", "--host", "127.0.0.1"], cwd=root, env={**os.environ, "DEX3JS_TEST_PORT":str(port)}, start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
     try:
-        for _ in range(60):
+        # macOS may take several seconds to schedule a fresh Node process under load.
+        for _ in range(300):
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                     break
             except OSError:
                 if proc.poll() is not None:
-                    raise RuntimeError("Disposable development server exited before readiness")
+                    raise RuntimeError(f"Disposable development server exited before readiness: {Path(log.name).read_text()}")
                 time.sleep(0.1)
         else:
-            raise RuntimeError("Disposable development server did not become ready")
+            raise RuntimeError(f"Disposable development server did not become ready: {Path(log.name).read_text()}")
         start = subprocess.run(["/bin/ps", "-p", str(proc.pid), "-o", "lstart="], check=True, capture_output=True, text=True).stdout.strip()
         state.parent.mkdir(parents=True, exist_ok=True)
         state.write_text(json.dumps({"version":1,"pid":proc.pid,"pgid":proc.pid,"start":start,"cwd":str(root),"executable":npm,"appBundleID":"com.westkitty.dex3js"}, indent=2))

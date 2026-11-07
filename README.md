@@ -20,7 +20,7 @@ User settings live at `~/Library/Application Support/DEX 3js/settings.json`, sch
 
 ## Control Center dashboard
 
-DEX now starts on a **Control Center** tab. It keeps the existing project launcher while adding live local service status for a configured project URL, the Three.js DevTools scene bridge, Studio API, and Studio editor. It offers a one-click **Inspect live scene** workflow through the existing `3d-lab inspect` command, captures a real scene tree in the native window, and opens Studio or the selected project in Chrome for Needle Inspector. A reachable endpoint is not proof of Three.js rendering or an MCP client invocation. No new runtime dependency is installed.
+DEX now starts on a **Control Center** tab. It keeps the existing project launcher while adding live local service status for a configured project URL, the Three.js DevTools scene bridge, Studio API, and Studio editor. After DEX starts a trusted project, **Inspect live scene** opens a persistent session through the installed DevTools MCP and displays the real scene hierarchy and selected object details. Supported material values can be previewed in that browser session and individually or fully reverted; source files are never changed. Studio and the selected project still open through the installed Studio and Chrome/Needle tooling. A reachable endpoint is not proof of Three.js rendering or an MCP client invocation. No new runtime dependency is installed.
 
 See [docs/CONTROL_CENTER.md](docs/CONTROL_CENTER.md) for the exact actions, status meanings, editing boundaries, and recovery steps.
 

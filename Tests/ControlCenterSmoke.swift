@@ -39,7 +39,7 @@ final class MockHTTP: URLProtocol {
 
         MockHTTP.payload = #"{"connected":true}"#
         let connected = await ToolProbe.check("http://127.0.0.1:9222/__devtools_status", bridge: true, session: session)
-        precondition(connected.state == .ready, "Expected scene bridge connected")
+        precondition(connected.state == .connected, "Expected a connected scene bridge")
         MockHTTP.payload = #"{"connected":false}"#
         let waiting = await ToolProbe.check("http://127.0.0.1:9222/__devtools_status", bridge: true, session: session)
         precondition(waiting.state == .disconnected, "Expected bridge awaiting scene")
