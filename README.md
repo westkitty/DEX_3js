@@ -18,6 +18,12 @@ Add an existing project using the folder picker. DEX 3js checks for `package.jso
 
 User settings live at `~/Library/Application Support/DEX 3js/settings.json`, schema version 1. Writes are atomic and maintain `settings.last-good.json`; malformed settings are rejected and recover from the last valid file. Use Export settings for a backup. After an external IDE edits settings, choose Configuration → Reload from disk (or press Option-Command-R). Project profiles can also be imported/exported and reloaded from `dex3js.json`. Settings and process records are stored with owner-only file permissions. The application is intentionally data-only: no field contains an executable shell command. Example project metadata for the interoperable project format is in `examples/dex3js.json`.
 
+## Control Center dashboard
+
+DEX now starts on a **Control Center** tab. It keeps the existing project launcher while adding live local service status for a configured project URL, the Three.js DevTools scene bridge, Studio API, and Studio editor. It offers a one-click **Inspect live scene** workflow through the existing `3d-lab inspect` command, captures a real scene tree in the native window, and opens Studio or the selected project in Chrome for Needle Inspector. A reachable endpoint is not proof of Three.js rendering or an MCP client invocation. No new runtime dependency is installed.
+
+See [docs/CONTROL_CENTER.md](docs/CONTROL_CENTER.md) for the exact actions, status meanings, editing boundaries, and recovery steps.
+
 ## Shared tools
 
 The app shows the requested tool inventory with separate, conservative status values. MCP registrations and live connections are distinct. The application itself does not change Codex/Claude configuration. Confirm MCP invocation inside each desktop client's local project session. Integrations remain in `~/.local/share/3d-lab`; see `docs/TOOL-INVENTORY.md` for inventory. This release's current observed client result is recorded in `docs/VALIDATION.md`; neither a config entry nor CLI connectivity is desktop invocation proof. Never place credentials, browser profiles, node_modules, or private project paths in this repository.

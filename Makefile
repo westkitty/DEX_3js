@@ -1,10 +1,11 @@
 APP=build/DEX 3js.app
 BIN=$(APP)/Contents/MacOS/DEX3js
+SOURCES=Sources/DEX3js/main.swift Sources/DEX3js/ToolRuntime.swift
 
 .PHONY: build install run clean test integration-test uninstall
 build:
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
-	swiftc -swift-version 5 -parse-as-library -framework SwiftUI -framework AppKit Sources/DEX3js/main.swift -o "$(BIN)"
+	swiftc -swift-version 5 -parse-as-library -framework SwiftUI -framework AppKit $(SOURCES) -o "$(BIN)"
 	cp Resources/Info.plist "$(APP)/Contents/Info.plist"
 
 install: build
@@ -17,7 +18,10 @@ run: build
 	open -n "$(APP)"
 
 test:
-	swiftc -swift-version 5 -parse-as-library -framework SwiftUI -framework AppKit -typecheck Sources/DEX3js/main.swift
+	swiftc -swift-version 5 -parse-as-library -framework SwiftUI -framework AppKit -typecheck $(SOURCES)
+	swiftc -swift-version 5 Sources/DEX3js/ToolRuntime.swift Tests/ControlCenterSmoke.swift -o /tmp/dex3js-control-center-smoke
+	/tmp/dex3js-control-center-smoke
+	rm -f /tmp/dex3js-control-center-smoke
 	swiftc -swift-version 5 Tests/ProcessGroupSmoke.swift -o /tmp/dex3js-process-group-smoke
 	/tmp/dex3js-process-group-smoke
 	rm -f /tmp/dex3js-process-group-smoke

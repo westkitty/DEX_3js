@@ -29,6 +29,15 @@ struct ProfileAction: Codable { var name: String; var path: String }
     @Published var processState = "Stopped"
     @Published var processLog = ""
     @Published var serverURL = ""
+    @Published var health: [String: ProbeObservation] = [:]
+    @Published var isCheckingTools = false
+    @Published var lastCheckedAt: Date?
+    @Published var inspectionOutput = ""
+    @Published var inspecting = false
+    private var inspectionProcess: Process?
+    private var inspectionPipe: Pipe?
+    private var inspectionProject = ""
+    private var probeSequence = UUID()
     private var process: Process?
     private var logPipe: Pipe?
     private let file: URL
@@ -71,7 +80,18 @@ struct ProfileAction: Codable { var name: String; var path: String }
         settings.projects.removeAll { $0.path == project.path }; settings.projects.insert(project, at: 0); if maySelect { selectedID = project.id }; save()
     }
     func removeSelected() { guard let p = selected else { return }; guard process == nil else { message = "Stop the managed project before removing it"; return }; settings.projects.removeAll { $0.id == p.id }; selectedID = settings.projects.first?.id; serverURL = ""; processLog = ""; processState = "Stopped"; save() }
-    func selectProject(_ id: UUID?) { guard process == nil || id == selectedID else { message = "Stop the managed project before switching projects"; return }; if selectedID != id { selectedID = id; serverURL = ""; processLog = ""; processState = "Stopped"; message = "Project selected" } }
+    func selectProject(_ id: UUID?) {
+        guard process == nil || id == selectedID else { message = "Stop the managed project before switching projects"; return }
+        guard !inspecting || id == selectedID else { message = "Finish or cancel scene inspection before switching projects"; return }
+        if selectedID != id {
+            selectedID = id; serverURL = ""; processLog = ""; processState = "Stopped"
+            probeSequence = UUID(); health = [:]; lastCheckedAt = nil
+            inspectionOutput = ""; inspectionProject = ""
+            message = "Project selected"
+            isCheckingTools = false
+            refreshHealth()
+        }
+    }
     func toggleFavorite(_ p: Project) { guard let i = settings.projects.firstIndex(where: {$0.id == p.id}) else { return }; settings.projects[i].favorite.toggle(); save() }
     func reloadProfile() { guard let p = selected, let profile = readProfile(at: URL(fileURLWithPath: p.path)) else { message = "Missing or invalid dex3js.json profile"; return }; guard let i = settings.projects.firstIndex(where: {$0.id == p.id}) else { return }; settings.projects[i].name = profile.name; settings.projects[i].url = profile.url; settings.projects[i].actions = profile.actions.map { ProjectAction(name: $0.name, url: $0.path) }; save() }
     func importProfile() { let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowedContentTypes = [.json]; if panel.runModal() == .OK, let url = panel.url, let profile = decodeProfile(at: url), let i = settings.projects.firstIndex(where: {$0.id == selectedID}) { settings.projects[i].name = profile.name; settings.projects[i].url = profile.url; settings.projects[i].actions = profile.actions.map { ProjectAction(name: $0.name, url: $0.path) }; save() } else { message = "Selected profile is invalid or no project is selected" } }
@@ -147,8 +167,151 @@ struct ProfileAction: Codable { var name: String; var path: String }
         let lab = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".local/bin/3d-lab")
         guard FileManager.default.isExecutableFile(atPath: lab.path) else { message = "Shared 3d-lab launcher is missing"; return }
         let task = Process(); task.executableURL = lab; task.arguments = ["studio"]; task.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory()); task.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": NSHomeDirectory()]
-        do { try task.run(); message = "Started the shared Studio through 3d-lab; it tracks its own services" }
-        catch { message = "Studio launch failed: \(error.localizedDescription)" }
+        do {
+            try task.run()
+            message = "Studio launch requested; refresh connections to confirm readiness"
+        } catch { message = "Studio launch failed: \(error.localizedDescription)" }
+    }
+
+    // Explicit, bounded local probes: an installed or registered MCP is not a live connection.
+    func refreshHealth() {
+        guard !isCheckingTools else { return }
+        let token = UUID()
+        probeSequence = token
+        isCheckingTools = true
+        let selectedURL = serverURL.isEmpty ? selected?.url : serverURL
+        health = [
+            "project": .checking,
+            "bridge": .checking,
+            "studioAPI": .checking,
+            "studioWeb": .checking
+        ]
+        Task { [weak self] in
+            async let project = ToolProbe.check(selectedURL)
+            async let bridge = ToolProbe.check("http://127.0.0.1:9222/__devtools_status", bridge: true)
+            async let api = ToolProbe.check("http://127.0.0.1:4000/health")
+            async let web = ToolProbe.check("http://127.0.0.1:5180/")
+            let resolved = await [
+                "project": project,
+                "bridge": bridge,
+                "studioAPI": api,
+                "studioWeb": web
+            ]
+            guard let self, self.probeSequence == token else { return }
+            self.health = resolved
+            self.lastCheckedAt = Date()
+            self.isCheckingTools = false
+            self.message = "Local connection check completed"
+        }
+    }
+    func probe(_ key: String) -> ProbeObservation {
+        health[key] ?? .unknown
+    }
+    func openSelectedProject() {
+        guard let raw = (serverURL.isEmpty ? selected?.url : serverURL),
+              let url = LocalEndpoint.validated(raw) else {
+            message = "Start the project or configure a local HTTP URL first"; return
+        }
+        openURL(url.absoluteString)
+    }
+    func openProjectAction(_ action: ProjectAction) {
+        guard let raw = (serverURL.isEmpty ? selected?.url : serverURL),
+              let base = LocalEndpoint.validated(raw),
+              action.url.hasPrefix("/"), !action.url.hasPrefix("//"),
+              let target = URL(string: action.url, relativeTo: base)?.absoluteURL,
+              let checked = LocalEndpoint.validated(target.absoluteString) else {
+            message = "This project action has no safe local destination"; return
+        }
+        openURL(checked.absoluteString)
+    }
+    func openStudioWeb() {
+        guard probe("studioWeb").state == .ready else {
+            message = "Studio web is not verified reachable. Start Studio, then refresh connections."; return
+        }
+        openURL("http://127.0.0.1:5180/")
+    }
+    func openNeedleInChrome() {
+        guard let raw = (serverURL.isEmpty ? selected?.url : serverURL),
+              let target = LocalEndpoint.validated(raw) else {
+            message = "Start the local project before opening its inspector"; return
+        }
+        let chrome = URL(fileURLWithPath: "/Applications/Google Chrome.app")
+        guard FileManager.default.fileExists(atPath: chrome.path) else {
+            message = "Google Chrome not found at the expected location"; return
+        }
+        NSWorkspace.shared.open([target], withApplicationAt: chrome, configuration: NSWorkspace.OpenConfiguration())
+        message = "Requested Chrome opening; enable Needle Inspector from its extension toolbar"
+    }
+    func inspectScene() {
+        guard !inspecting else { message = "An inspection is already running"; return }
+        guard let project = selected, project.trusted else {
+            message = "Select a trusted project before launching its inspector"; return
+        }
+        guard FileManager.default.fileExists(atPath: URL(fileURLWithPath: project.path).appendingPathComponent("package.json").path) else {
+            message = "Project package.json is missing"; return
+        }
+        let lab = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".local/bin/3d-lab")
+        guard FileManager.default.isExecutableFile(atPath: lab.path) else {
+            message = "Shared 3d-lab inspector is missing"; return
+        }
+        let task = Process()
+        task.executableURL = lab
+        task.arguments = ["inspect", "--project", project.path]
+        task.currentDirectoryURL = URL(fileURLWithPath: project.path)
+        task.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": NSHomeDirectory()]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        inspectionPipe = pipe
+        inspectionOutput = "Connecting to real Three.js scene…\n"
+        inspectionProject = project.path
+        inspecting = true
+        let expectedPath = project.path
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty, let string = String(data: chunk, encoding: .utf8) else { return }
+            Task { @MainActor in
+                guard let self, self.inspectionProject == expectedPath else { return }
+                self.inspectionOutput = String((self.inspectionOutput + string).suffix(24000))
+            }
+        }
+        task.terminationHandler = { [weak self] process in
+            Task { @MainActor in
+                guard let self else { return }
+                self.inspectionPipe?.fileHandleForReading.readabilityHandler = nil
+                self.inspectionPipe = nil
+                self.inspectionProcess = nil
+                self.inspecting = false
+                if process.terminationStatus == 0 {
+                    self.message = "Scene inspection returned; source files untouched"
+                } else {
+                    self.message = "Scene inspection stopped or failed (exit \(process.terminationStatus)); see output"
+                }
+            }
+        }
+        do {
+            try task.run()
+            inspectionProcess = task
+            message = "Inspecting live project scene"
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            inspectionPipe = nil
+            inspecting = false
+            inspectionProcess = nil
+            inspectionOutput += "Failed to start: \(error.localizedDescription)"
+            message = "Scene inspector could not start"
+        }
+    }
+    func cancelInspection() {
+        guard let current = inspectionProcess, current.isRunning else { return }
+        let pid = current.processIdentifier
+        // Signal the launcher-owned process group only if the OS confirms ownership.
+        if Darwin.getpgid(pid) == pid {
+            _ = Darwin.kill(-pid, SIGTERM)
+        } else {
+            current.terminate()
+        }
+        message = "Cancel requested for the selected inspection process"
     }
     func diagnostics() -> String {
         let tool = "~/.local/share/3d-lab"; let exists = FileManager.default.fileExists(atPath: NSString(string: tool).expandingTildeInPath)
@@ -176,12 +339,12 @@ extension JSONEncoder { static var pretty: JSONEncoder { let e = JSONEncoder(); 
 
 @main struct DEX3jsApp: App {
     @StateObject private var store = Store()
-    var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(.light).onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in store.stop() } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
+    var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(.light).onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in store.cancelInspection(); store.stop() } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
 }
 
 struct MainView: View {
     @EnvironmentObject var store: Store
-    @State private var tab = "Projects"
+    @State private var tab = "Control Center"
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 16) {
@@ -202,14 +365,160 @@ struct MainView: View {
                 }.padding(16).frame(width: 290).background(Color(nsColor: .controlBackgroundColor))
                 Divider()
                 VStack(alignment: .leading, spacing: 0) {
-                    HStack(spacing: 8) { ForEach(["Projects", "Toolbox", "Diagnostics", "Configuration"], id: \.self) { x in Button(x) { tab = x }.buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 8).background(tab == x ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7)).foregroundStyle(tab == x ? Color.accentColor : .secondary) } }.padding(.horizontal, 22).padding(.vertical, 14)
+                    HStack(spacing: 8) { ForEach(["Control Center", "Projects", "Toolbox", "Diagnostics", "Configuration"], id: \.self) { x in Button(x) { tab = x }.buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 8).background(tab == x ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7)).foregroundStyle(tab == x ? Color.accentColor : .secondary) } }.padding(.horizontal, 22).padding(.vertical, 14)
                     Divider()
-                    ScrollView { VStack(alignment: .leading, spacing: 18) { Group { if tab == "Projects" { projectDetail } else if tab == "Toolbox" { toolbox } else if tab == "Diagnostics" { diagnostics } else { configuration } }.padding(22) }.frame(maxWidth: .infinity, alignment: .leading) }
+                    ScrollView { VStack(alignment: .leading, spacing: 18) { Group { if tab == "Control Center" { controlCenter } else if tab == "Projects" { projectDetail } else if tab == "Toolbox" { toolbox } else if tab == "Diagnostics" { diagnostics } else { configuration } }.padding(22) }.frame(maxWidth: .infinity, alignment: .leading) }
                     Divider()
                     HStack { Circle().fill(store.processState.hasPrefix("Running") ? .green : .gray).frame(width: 8, height: 8); Text(store.processState); Spacer(); Text(store.message).foregroundStyle(.secondary).lineLimit(1) }.font(.caption).padding(.horizontal, 20).padding(.vertical, 12)
                 }
             }
-        }.background(Color(nsColor: .windowBackgroundColor))
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear { store.refreshHealth() }
+    }
+    var controlCenter: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Control Center").font(.system(size: 28, weight: .semibold))
+                    Text("Run your project. Inspect the scene. Know what's connected.").foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            if let project = store.selected {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(project.name).font(.headline)
+                                Text(project.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                            Spacer()
+                            Text(store.processState).font(.caption).foregroundStyle(.secondary)
+                        }
+                        HStack(spacing: 8) {
+                            Button("Start project") { store.start(); store.refreshHealth() }.disabled(!project.trusted || store.processState.hasPrefix("Running"))
+                            Button("Stop project") { store.stop() }.disabled(!store.processState.hasPrefix("Running"))
+                            Button("Open project") { store.openSelectedProject() }
+                            Button("Open folder") { store.openFolder() }
+                        }
+                        if !project.trusted {
+                            Text("To start this project, review and approve its dev script in Projects.").font(.callout).foregroundStyle(.orange)
+                        }
+                        if !project.actions.isEmpty {
+                            Text("Museum & project views").font(.subheadline.weight(.medium))
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(project.actions) { action in
+                                    Button(action.name) { store.openProjectAction(action) }
+                                        .buttonStyle(.bordered)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                    }.padding(7)
+                } label: { Label("Active project", systemImage: "cube.transparent") }
+            } else {
+                ContentUnavailableView("Choose a project", systemImage: "folder", description: Text("Select a Three.js project in the left sidebar."))
+            }
+            healthPanel
+            inspectorPanel
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Studio is a separate scene-authoring workspace, not an editable copy of your museum.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Start Studio") { store.studio() }
+                        Button("Open Studio") { store.openStudioWeb() }.disabled(store.probe("studioWeb").state != .ready)
+                        Button("Open Needle in Chrome") { store.openNeedleInChrome() }.disabled(store.selected == nil)
+                    }
+                    Text("Needle: enable the Chrome extension for the local site; Pro-only edits may require a license. DevTools material previews are not source edits.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.padding(7)
+            } label: { Label("Visual tools", systemImage: "slider.horizontal.3") }
+        }
+    }
+    var healthPanel: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Actual loopback responses — not installation guesses").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button(store.isCheckingTools ? "Checking…" : "Refresh connections") { store.refreshHealth() }
+                        .disabled(store.isCheckingTools)
+                }
+                ForEach(["project", "bridge", "studioAPI", "studioWeb"], id: \.self) { key in
+                    HStack(alignment: .center) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(healthTitle(key)).font(.callout.weight(.medium))
+                            Text(store.probe(key).detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(store.probe(key).state.rawValue)
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 9).padding(.vertical, 5)
+                            .background(healthColor(store.probe(key).state).opacity(0.12), in: Capsule())
+                    }
+                    Divider()
+                }
+                if let checked = store.lastCheckedAt {
+                    Text("Last checked: \(checked.formatted(date: .omitted, time: .standard))")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }.padding(7)
+        } label: { Label("Connections", systemImage: "point.3.connected.trianglepath.dotted") }
+    }
+    var inspectorPanel: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Read the actual Three.js scene tree through the installed DevTools MCP. This check does not change the project source.")
+                    .font(.callout).foregroundStyle(.secondary)
+                HStack {
+                    Button(store.inspecting ? "Inspecting…" : "Inspect live scene") { store.inspectScene() }
+                        .disabled(store.inspecting || store.selected == nil)
+                    if store.inspecting {
+                        Button("Cancel inspection") { store.cancelInspection() }
+                    }
+                    if !store.inspectionOutput.isEmpty {
+                        Button("Copy output") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(store.inspectionOutput, forType: .string)
+                        }
+                    }
+                }
+                if !store.inspectionOutput.isEmpty {
+                    ScrollView {
+                        Text(store.inspectionOutput)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
+                    .frame(minHeight: 130, maxHeight: 310)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Text("No inspection recorded this session. Start the project, then choose Inspect live scene.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }.padding(7)
+        } label: { Label("Live scene", systemImage: "square.3.layers.3d") }
+    }
+    func healthTitle(_ key: String) -> String {
+        switch key {
+        case "project": return "Configured project URL"
+        case "bridge": return "Three.js DevTools scene bridge"
+        case "studioAPI": return "AI Three.js Studio API"
+        case "studioWeb": return "AI Three.js Studio editor"
+        default: return key
+        }
+    }
+    func healthColor(_ state: ProbeState) -> Color {
+        switch state {
+        case .ready: return .green
+        case .checking: return .blue
+        case .disconnected: return .orange
+        case .blocked, .stopped: return .red
+        case .unknown: return .gray
+        }
     }
     func statusPill(_ title: String, icon: String, state: String) -> some View { HStack(spacing: 6) { Image(systemName: icon); VStack(alignment: .leading, spacing: 1) { Text(title).font(.caption.weight(.semibold)); Text(state).font(.caption2).foregroundStyle(.secondary) } }.padding(8).background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8)) }
     var projectDetail: some View {
@@ -219,7 +528,7 @@ struct MainView: View {
             GroupBox("Development server") { VStack(alignment: .leading, spacing: 10) { HStack { Text(store.processState); Spacer(); if !store.serverURL.isEmpty { Button("Open") { store.openURL(store.serverURL) } }; Button("Start") { store.start() }.disabled(store.processState.hasPrefix("Running")); Button("Stop") { store.stop() }.disabled(!store.processState.hasPrefix("Running")) }; if !store.serverURL.isEmpty { Text(store.serverURL).font(.system(.body, design: .monospaced)) }; if !store.processLog.isEmpty { Text(store.processLog).font(.system(.caption, design: .monospaced)).lineLimit(8).textSelection(.enabled) } }.padding(6) }
             HStack { Button("Open in Browser") { if !store.serverURL.isEmpty { store.openURL(store.serverURL) } else if let url = p.url { store.openURL(url) } }.disabled(store.serverURL.isEmpty && p.url == nil); Button("Open Folder") { store.openFolder() }; Button("Open in IDE") { store.openEditor() }; Button("Copy URL") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(store.serverURL, forType: .string) }.disabled(store.serverURL.isEmpty); Button("Studio") { store.studio() } }
             HStack { Button("Import profile…") { store.importProfile() }; Button("Reload dex3js.json") { store.reloadProfile() }; Button("Export dex3js.json") { store.exportProfile() } }
-            GroupBox("Project actions") { VStack(alignment: .leading, spacing: 6) { if p.actions.isEmpty { Text("No project actions configured. Add named URLs to dex3js.json; examples are in the repository.").foregroundStyle(.secondary) } else { ForEach(p.actions) { action in Button(action.name) { let base = store.serverURL.isEmpty ? p.url : store.serverURL; if let base, let baseURL = URL(string: base), let target = URL(string: action.url, relativeTo: baseURL)?.absoluteURL { store.openURL(target.absoluteString) } } } } }.frame(maxWidth: .infinity, alignment: .leading).padding(6) }
+            GroupBox("Project actions") { VStack(alignment: .leading, spacing: 6) { if p.actions.isEmpty { Text("No project actions configured. Add named URLs to dex3js.json; examples are in the repository.").foregroundStyle(.secondary) } else { ForEach(p.actions) { action in Button(action.name) { store.openProjectAction(action) } } } }.frame(maxWidth: .infinity, alignment: .leading).padding(6) }
             Toggle("I reviewed this project's dev script and approve running it", isOn: Binding(get: { p.trusted }, set: { store.setTrust($0) })).font(.caption)
         } else { ContentUnavailableView("Select a project", systemImage: "cube.transparent", description: Text("Add an existing Three.js project with the folder picker.")); Button("Add Project") { store.selectFolder() } } }
     }
