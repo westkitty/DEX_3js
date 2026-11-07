@@ -119,3 +119,38 @@ Museum Stop/restart ownership and route behavior were verified in the preceding 
 ## Final requested running state — 2026-11-06 (America/Detroit)
 
 After the installed Stop test passed, Museum was started again from the installed dashboard for the requested live workflow. Chrome displayed the Museum title/arrival screen at `127.0.0.1:5173/`; the Needle Inspector 2.9.0 toolbar control reported access to this site. DEX PID 51021 owns PGID 51021, and the owner-only process record matches the Museum working directory. Port 5173 is listening under that group. This is the intentional final runtime state, not an orphan; Stop was separately verified above. AI Three.js Studio API/web services also remain available from the requested Start Studio action.
+
+## Phase 4 workstation and lifecycle validation — 2026-11-07 (America/Detroit)
+
+### Phase 3 Git state
+
+Phase 3 commit `30e6324b7b6f55eee4208c417822adf49fa17694` was already pushed to `origin/feat/dex3js-dark-browser-lifecycle` and read back at that SHA. Phase 4 is on `feat/dex3js-inspector-session-lifecycle`; no Phase 4 commit, push, merge, or publication was made.
+
+### Changes and defect repair
+
+- Kept the existing native SwiftUI app and installed Three.js DevTools MCP. The adapter launches one isolated Puppeteer Chrome profile, validates its MCP/browser parentage, profile, loopback CDP listener, proxy URL and exact target ID, serializes commands and shuts down the owned session through its MCP transport.
+- The installed inspector could fail under host load because its global `ps` scan had a 1.2-second timeout. It now allows 5 seconds per process scan and up to 30 seconds to identify the launched target. Startup errors include bounded MCP diagnostics.
+- A second observed defect was a stale `Stopped` label after DEX restarted while a recorded Museum process was still alive. Startup now revalidates the owner-only record against PID, process group, start time, trusted project and live working directory before restoring the project state. Stop rechecks ownership before signaling a recovered process group. An unverifiable record cannot authorize a signal.
+- Lifecycle tests now run ten separate browser sessions, verify same-target reuse within each session, loopback-only CDP, error/reuse behavior, explicit close and adapter-EOF cleanup, and preservation of pre-existing Chrome PIDs. A concurrent unrelated Playwright Chrome process previously made the old global “no new Chrome PID” assertion fail; the test now checks its own isolated PID and confirms all baseline Chrome PIDs remain alive.
+- Updated the existing README and Control Center guide. No Museum source, assets, exhibits, or published website were modified.
+
+### Exact checks and installation
+
+- `make test`: PASS. Node syntax; 10/10 isolated browser sessions; Swift typecheck; loopback/bridge smoke; forced-dark smoke; process-group smoke.
+- `make integration-test`: PASS. Disposable managed group stopped; stale empty record cleared without signaling; live orphan preserved.
+- `make build`: PASS.
+- `make install`: PASS to `/Users/andrew/Applications/DEX 3js.app`, plus the existing user CLI and safe-stop helper paths.
+- `git diff --check`: PASS after implementation and documentation review.
+- Installed executable SHA-256: `1bc57384d7dca0af7d441c1c92003aa72491c5c0e7f625da5b0e18fa851efed7` (matches `build/DEX 3js.app`). Installed `scene-bridge.mjs` SHA-256: `cf9a2476cde28a9dcd5b632bb89f29d788a1c5f6209c6c1425f2a4f16ece11c0` (matches source).
+
+### Installed runtime evidence
+
+The installed native Control Center was reopened. Its saved Museum of Me profile and route shortcuts remained available. Museum started through DEX as PID/PGID `62596`; the project URL became reachable. DEX connected to the actual scene and the native hierarchy displayed `museum` with `exterior-world`, `lighting` and `museum-authored-placements`. Session status showed Connected, one exact Chrome target ID, one localhost proxy and a successful scene refresh. The CDP target list reported one page titled `Museum of Me — The Reliquary of Iterative Becoming` at the DEX proxy. The native Open Inspector action was invoked. Scene bridge/session was DEX-owned under helper PID/PGID `63772`, with MCP PID `63801` and isolated Chrome PID `63873`; the proxy was `127.0.0.1:52158` and CDP `127.0.0.1:52159`. These were live loopback listeners at final readback.
+
+Studio API `/health` and editor on port `5180` returned successfully. At final readback there was one DEX-owned inspector session, one MCP, one isolated Chrome browser target/page, and one proxy. Two pre-existing Codex-owned MCP/Chrome pairs (Chrome PIDs `59719` and `61807`) remained present and were not signaled. The Museum owner record matched PID/PGID `62596` and its project directory. The running DEX app was the installed bundle.
+
+### Limits and status
+
+The Mac was under enough load that desktop automation calls sometimes took 20–29 seconds. The first post-install inspector launch exposed the 1.2-second process-scan timeout; after the source fix, the installed app connected successfully and returned the real scene. CUA's Chrome surface showed a separate test-controlled New Tab rather than the DEX isolated-profile window, so I did not claim a visual inspection of the Chrome canvas or Needle extension panel. The CDP target title and URL establish the live Museum target, not that its window was visually foregrounded. VoiceOver and full keyboard coverage were not performed. Store restart-recovery code compiled, but a second-app-instance recovery was not exercised. The previous App Management notification was not retriggered; no privacy/security setting was changed.
+
+**Phase 4: SOURCE IMPLEMENTED, TESTS PASS, INSTALLED, AND LIVE MUSEUM SCENE VERIFIED IN THE NATIVE DASHBOARD. PARTIAL against the full GUI acceptance list: visible isolated-browser/Needle panel, VoiceOver, and app-restart reattachment remain unverified. Uncommitted and unpushed.**
