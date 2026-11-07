@@ -107,7 +107,7 @@ private struct ProjectProcessRecord: Decodable {
     @Published var isPreviewMutationPending = false
     private var sceneProcess: Process?
     private var sceneInput: Pipe?
-    private var sceneBuffer = Data()
+    private var sceneFramer = SceneOutputFramer()
     private var nextSceneCommand = 0
     private var sceneCompletions: [Int: SceneCompletion] = [:]
     private var sceneGeneration = UUID()
@@ -160,8 +160,8 @@ private struct ProjectProcessRecord: Decodable {
     private let file: URL
     private let lastGood: URL
     private let processRecord: URL
-    init() {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/DEX 3js", isDirectory: true)
+    init(settingsDirectory: URL? = nil) {
+        let dir = settingsDirectory ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/DEX 3js", isDirectory: true)
         file = dir.appendingPathComponent("settings.json"); lastGood = dir.appendingPathComponent("settings.last-good.json"); processRecord = dir.appendingPathComponent("process.json")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
@@ -301,6 +301,8 @@ private struct ProjectProcessRecord: Decodable {
         guard let data = try? Data(contentsOf: processRecord),
               let record = try? JSONDecoder().decode(ProjectProcessRecord.self, from: data),
               record.appBundleID == "com.westkitty.dex3js", record.pid > 1, record.pgid == record.pid,
+              ["/opt/homebrew/bin/npm", "/usr/local/bin/npm", "/opt/homebrew/bin/pnpm", "/usr/local/bin/pnpm",
+               "/opt/homebrew/bin/yarn", "/usr/local/bin/yarn", "/opt/homebrew/bin/bun", "/usr/local/bin/bun"].contains(record.executable),
               let project = settings.projects.first(where: { $0.path == record.cwd }), project.trusted else { return nil }
         func output(_ executable: String, _ arguments: [String]) -> String? {
             let task = Process(); task.executableURL = URL(fileURLWithPath: executable); task.arguments = arguments
@@ -308,14 +310,22 @@ private struct ProjectProcessRecord: Decodable {
             guard (try? task.run()) != nil else { return nil }; task.waitUntilExit()
             return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        guard let status = output("/bin/ps", ["-p", String(record.pid), "-o", "pgid=,lstart=,args="]) else { return nil }
-        let fields = status.split(maxSplits: 7, whereSeparator: { $0.isWhitespace })
-        guard fields.count >= 8, Int32(fields[0]) == record.pgid,
-              fields[1...6].map(String.init).joined(separator: " ") == record.start,
-              status.localizedCaseInsensitiveContains("run dev"),
-              let cwd = output("/usr/sbin/lsof", ["-a", "-p", String(record.pid), "-d", "cwd", "-Fn"]),
-              cwd.contains("\nn\(record.cwd)") else { return nil }
+        guard let groupText = output("/bin/ps", ["-p", String(record.pid), "-o", "pgid="]),
+              let group = Int32(groupText), group == record.pgid,
+              let start = output("/bin/ps", ["-p", String(record.pid), "-o", "lstart="]), start == record.start,
+              let command = output("/bin/ps", ["-p", String(record.pid), "-o", "args="]),
+              command.split(whereSeparator: \.isWhitespace).first.map(String.init) == URL(fileURLWithPath: record.executable).lastPathComponent,
+              command.localizedCaseInsensitiveContains("run dev"),
+              let cwdOutput = output("/usr/sbin/lsof", ["-a", "-p", String(record.pid), "-d", "cwd", "-Fn"]),
+              let liveCWD = cwdOutput.split(separator: "\n").first(where: { $0.hasPrefix("n") }).map({ String($0.dropFirst()) }),
+              let recordedCWD = Self.canonicalFilesystemPath(record.cwd),
+              let actualCWD = Self.canonicalFilesystemPath(liveCWD), recordedCWD == actualCWD else { return nil }
         return record
+    }
+    private static func canonicalFilesystemPath(_ path: String) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard path.withCString({ realpath($0, &buffer) }) != nil else { return nil }
+        return String(cString: buffer)
     }
     func stop() {
         if sceneSessionActive { disconnectScene() }
@@ -445,7 +455,7 @@ private struct ProjectProcessRecord: Decodable {
         guard let helper = Bundle.main.resourceURL?.appendingPathComponent("scene-bridge.mjs"), FileManager.default.fileExists(atPath: helper.path) else { sceneStatus = "Unavailable"; message = "Scene bridge helper is missing; rebuild DEX."; return }
         guard sceneProcess == nil else { message = "The previous inspector session is still shutting down"; return }
         let sessionID = UUID().uuidString
-        sceneGeneration = UUID(); sceneCompletions.removeAll(); sceneBuffer = Data()
+        sceneGeneration = UUID(); sceneCompletions.removeAll(); sceneFramer.reset()
         sceneSessionID = sessionID; sceneSessionProject = project.name
         sceneSessionStartedAt = Date(); sceneLastActivityAt = Date(); sceneLastSuccessfulInspection = nil
         sceneBrowserName = "Google Chrome · isolated DEX profile"; sceneBrowserVersion = ""; sceneBrowserPID = 0; sceneMCPPID = 0
@@ -462,7 +472,15 @@ private struct ProjectProcessRecord: Decodable {
         task.terminationHandler = { [weak self] proc in Task { @MainActor in
             guard let self, self.sceneProcess?.processIdentifier == proc.processIdentifier else { return }
             self.sceneProcess = nil; self.sceneInput = nil; self.inspecting = false
+            let truncatedBytes = self.sceneFramer.finish()
+            let failure = truncatedBytes > 0
+                ? "Inspector helper exited with a truncated response (\(truncatedBytes) buffered bytes); reconnect to retry."
+                : "Inspector helper exited before completing the pending request; reconnect to retry."
+            let pending = Array(self.sceneCompletions.values)
+            self.sceneCompletions.removeAll()
+            pending.forEach { $0.callback(.failure(NSError(domain: "DEXScene", code: 4, userInfo: [NSLocalizedDescriptionKey: failure]))) }
             if self.sceneStatus == "Disconnecting" { return }
+            if !pending.isEmpty || truncatedBytes > 0 { self.sceneLastError = failure; self.inspectionOutput = failure }
             if self.sceneOwnedProcessGroup > 0 && Darwin.kill(-self.sceneOwnedProcessGroup, 0) == 0 {
                 self.sceneStatus = "Cleanup pending"
                 self.sceneCleanupMessage = "Inspector helper exited; DEX is verifying the owned MCP/browser resources are closed."
@@ -649,16 +667,36 @@ private struct ProjectProcessRecord: Decodable {
         catch { sceneCompletions.removeValue(forKey: id)?.callback(.failure(error)) }
     }
     private func consumeSceneOutput(_ data: Data) {
-        sceneBuffer.append(data)
-        while let newline = sceneBuffer.firstIndex(of: 10) {
-            let line = sceneBuffer.prefix(upTo: newline); sceneBuffer.removeSubrange(...newline)
-            guard let item = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
-            if item["event"] as? String == "ready" { if let session = item["session"] as? [String: Any] { applySceneSession(session) }; continue }
-            guard let id = item["id"] as? Int, let response = sceneCompletions.removeValue(forKey: id) else { continue }
-            guard response.generation == sceneGeneration else { continue }
-            if item["ok"] as? Bool == true { response.callback(.success(item["result"] ?? NSNull())) }
-            else { response.callback(.failure(NSError(domain: "DEXScene", code: 2, userInfo: [NSLocalizedDescriptionKey: item["error"] as? String ?? "MCP request failed"]))) }
+        switch sceneFramer.append(data) {
+        case .oversized: failSceneOutputOverflow()
+        case .lines(let lines): for line in lines {
+                guard let item = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                if item["event"] as? String == "ready" { if let session = item["session"] as? [String: Any] { applySceneSession(session) }; continue }
+                if item["event"] as? String == "disconnected" {
+                    guard let session = item["session"] as? [String: Any], session["sessionID"] as? String == sceneSessionID else { continue }
+                    let detail = item["error"] as? String ?? "Inspector bridge exited unexpectedly"
+                    sceneStatus = sceneSnapshotProject.isEmpty ? "Disconnected" : "Disconnected · cached snapshot"
+                    sceneLastError = detail; inspectionOutput = detail
+                    sceneCleanupMessage = "Bridge process exited; reconnect will verify and release only the owned browser before replacement"
+                    health["bridge"] = ProbeObservation(state: .disconnected, detail: "DEX DevTools MCP process exited")
+                    continue
+                }
+                guard let id = item["id"] as? Int, let response = sceneCompletions.removeValue(forKey: id) else { continue }
+                guard response.generation == sceneGeneration else { continue }
+                if item["ok"] as? Bool == true { response.callback(.success(item["result"] ?? NSNull())) }
+                else { response.callback(.failure(NSError(domain: "DEXScene", code: 2, userInfo: [NSLocalizedDescriptionKey: item["error"] as? String ?? "MCP request failed"]))) }
+            }
         }
+    }
+    private func failSceneOutputOverflow() {
+        let detail = "Inspector helper sent a response line larger than 1 MiB. The session was closed to bound memory use; reconnect after updating or restarting the helper."
+        sceneFramer.reset()
+        sceneGeneration = UUID()
+        let pending = Array(sceneCompletions.values)
+        sceneCompletions.removeAll()
+        sceneStatus = "Error"; sceneLastError = detail; inspectionOutput = detail; message = detail
+        pending.forEach { $0.callback(.failure(NSError(domain: "DEXScene", code: 3, userInfo: [NSLocalizedDescriptionKey: detail]))) }
+        disconnectScene()
     }
     func applySceneSession(_ value: [String: Any]) {
         func string(_ key: String) -> String { value[key] as? String ?? "" }
@@ -720,7 +758,7 @@ private struct ProjectProcessRecord: Decodable {
         guard group > 0, Darwin.getpgid(task.processIdentifier) == group else {
             task.terminate(); sceneStatus = "Cleanup unverified"; sceneLastError = "DEX lost its verified process-group identity; no group-wide cleanup was attempted."; completion?(false); return
         }
-        sceneGeneration = UUID(); sceneCompletions.removeAll(); inspecting = false; isPreviewMutationPending = false
+        sceneGeneration = UUID(); sceneCompletions.removeAll(); sceneFramer.reset(); inspecting = false; isPreviewMutationPending = false
         sceneStatus = "Disconnecting"; sceneCleanupMessage = "Closing only the isolated browser session launched by DEX"
         health["bridge"] = ProbeObservation(state: .disconnected, detail: "DEX scene inspector is disconnecting")
         sceneInput?.fileHandleForWriting.write(Data("{\"op\":\"close\"}\n".utf8))
@@ -763,11 +801,13 @@ private struct ProjectProcessRecord: Decodable {
     }
 }
 extension JSONEncoder { static var pretty: JSONEncoder { let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]; return e } }
+#if !DEX3JS_TESTING
 @main struct DEX3jsApp: App {
     @StateObject private var store = Store()
     init() { DEXAppearance.applyToApplication() }
     var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(DEXAppearance.colorScheme).onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in store.cancelInspection(); store.stop() } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
 }
+#endif
 
 struct MainView: View {
     @EnvironmentObject var store: Store
@@ -902,6 +942,8 @@ struct MainView: View {
                         HStack {
                             Label(store.sceneStatus, systemImage: store.sceneConnected ? "checkmark.circle.fill" : "point.3.connected.trianglepath.dotted")
                                 .foregroundStyle(store.sceneConnected ? .green : .secondary)
+                                .accessibilityLabel("Inspector connection status: \(store.sceneStatus)")
+                                .accessibilityAddTraits(.updatesFrequently)
                             Spacer()
                             Text(store.sceneSessionAge).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         }
@@ -920,7 +962,7 @@ struct MainView: View {
                             GridRow { Text("Last inspection").foregroundStyle(.secondary); Text(store.sceneLastSuccessfulInspection?.formatted(date: .abbreviated, time: .standard) ?? "Not yet completed") }
                         }.font(.caption)
                         if !store.sceneCleanupMessage.isEmpty { Text(store.sceneCleanupMessage).font(.caption).foregroundStyle(.secondary) }
-                        if !store.sceneLastError.isEmpty { Label(store.sceneLastError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
+                        if !store.sceneLastError.isEmpty { Label(store.sceneLastError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange).textSelection(.enabled).accessibilityAddTraits(.updatesFrequently) }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(5)
                 }
                 Text("Live hierarchy and object data come from the installed Three.js DevTools MCP. Preview changes live only in its browser session; they never edit project files.")
@@ -940,12 +982,12 @@ struct MainView: View {
                             } else {
                                 ForEach(store.visibleSceneMatches) { node in Button { store.selectSceneObject(node.path) } label: { VStack(alignment: .leading, spacing: 2) { Text(node.name).lineLimit(1); Text("\(node.type) · \(node.path)").font(.caption2).foregroundStyle(.secondary).lineLimit(2) }.frame(maxWidth: .infinity, alignment: .leading).padding(5).background(store.selectedScenePath == node.path ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 4)) }.buttonStyle(.plain).disabled(!node.canInspect).help(node.selectionDisabledReason ?? node.summary) }
                             }
-                        }.frame(maxWidth: .infinity, alignment: .leading).padding(6) }.frame(minHeight: 240, maxHeight: 330).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7)) }
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(6) }.accessibilityElement(children: .contain).accessibilityLabel("Live scene hierarchy").frame(minHeight: 240, maxHeight: 330).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7)) }
                     }.frame(minWidth: 260, maxWidth: 340, alignment: .leading)
                     Divider()
                     VStack(alignment: .leading, spacing: 7) {
                         Text("OBJECT INSPECTOR").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                        Text(store.selectedScenePath.isEmpty ? "Select an object in the hierarchy" : store.selectedScenePath).font(.caption).textSelection(.enabled)
+                        Text(store.selectedScenePath.isEmpty ? "Select an object in the hierarchy" : store.selectedScenePath).font(.caption).textSelection(.enabled).accessibilityLabel(store.selectedScenePath.isEmpty ? "No scene object selected" : "Selected scene object: \(store.selectedScenePath)")
                         ScrollView { Text(store.objectDetails.isEmpty ? "Select an object to read its properties." : store.objectDetails).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }.frame(minHeight: 180, maxHeight: 260).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
                         Text("TEMPORARY MATERIAL PREVIEW").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 7) {
@@ -954,6 +996,7 @@ struct MainView: View {
                                     .labelsHidden().accessibilityLabel("Material property").frame(width: 142)
                                 TextField("Value", text: $store.previewValue).frame(width: 74).accessibilityLabel("Numeric preview value")
                                 Button("Preview") { store.previewSceneChange() }.disabled(store.selectedScenePath.isEmpty || !store.sceneConnected)
+                                    .accessibilityHint("Requires a selected object with a supported material and a live scene connection.")
                             }
                             HStack(spacing: 8) {
                                 Button("Show pending") { store.loadPendingChanges() }.disabled(!store.sceneConnected)

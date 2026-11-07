@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ -n "$DEX3JS_TEST_BROWSER_LAUNCH_LOG" ]; then
+  printf '%s\n' "$*" >> "$DEX3JS_TEST_BROWSER_LAUNCH_LOG"
+fi
+printf '%s\n' 'DEX 3js blocked an unexpected system-browser fallback.' >&2
+exit 126
