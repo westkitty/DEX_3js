@@ -12,6 +12,7 @@ const entry = path.join(pkg, 'threejs-devtools-mcp/dist/index.js');
 const sdk = path.join(pkg, '@modelcontextprotocol/sdk/dist/esm/client/index.js');
 const stdio = path.join(pkg, '@modelcontextprotocol/sdk/dist/esm/client/stdio.js');
 let client, transport, closed = false;
+let sessionProject = '', sessionURL = '', sceneBrowserURL = '';
 const say = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 async function shutdown() {
   if (closed) return;
@@ -26,7 +27,14 @@ function decode(result) {
   try { return JSON.parse(text); } catch { return { text }; }
 }
 async function connect(project, url) {
-  if (client) { await client.close().catch(() => {}); await transport.close().catch(() => {}); }
+  if (url && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/?$/.test(url)) throw new Error('Project endpoint must be a local HTTP URL');
+  if (client && sessionProject === project && sessionURL === (url ?? '')) {
+    try {
+      await call('bridge_status');
+      return { connected: true, reused: true, browserURL: sceneBrowserURL };
+    } catch { /* A failed MCP round trip invalidates this session; replace only this owned child. */ }
+  }
+  if (client) { await client.close().catch(() => {}); await transport.close().catch(() => {}); client = undefined; transport = undefined; }
   const { Client } = await import(pathToFileURL(sdk));
   const { StdioClientTransport } = await import(pathToFileURL(stdio));
   const freePort = () => new Promise((resolve, reject) => {
@@ -35,17 +43,21 @@ async function connect(project, url) {
     server.listen(0, '127.0.0.1', () => { const port = server.address().port; server.close(() => resolve(port)); });
   });
   const bridgePort = await freePort();
-  let cdpPort = await freePort();
-  while (cdpPort === bridgePort) cdpPort = await freePort();
-  if (url && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/?$/.test(url)) throw new Error('Project endpoint must be a local HTTP URL');
+  const childEnv = { ...process.env, BROWSER: 'none', BRIDGE_PORT: String(bridgePort), ...(url ? { DEV_URL: url } : {}) };
+  for (const key of ['PUPPETEER', 'CDP_PORT', 'CHROME_PATH', 'HEADLESS', 'HTTP_PORT', 'DEV_PORT']) delete childEnv[key];
   transport = new StdioClientTransport({ command: process.execPath, args: [entry], cwd: project,
-    env: { ...process.env, PUPPETEER: 'true', CDP_PORT: String(cdpPort), BRIDGE_PORT: String(bridgePort), CHROME_PATH: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', ...(url ? { DEV_URL: url } : {}), HEADLESS: 'false' }, stderr: 'inherit' });
+    env: childEnv, stderr: 'inherit' });
   client = new Client({ name: 'dex3js-native-inspector', version: '1.0.0' }, { capabilities: {} });
   await client.connect(transport);
   const listed = await client.listTools();
   const names = new Set(listed.tools.map(x => x.name));
   for (const required of ['bridge_status', 'scene_tree', 'object_details']) if (!names.has(required)) throw new Error(`Installed DevTools MCP is missing ${required}`);
+  sessionProject = project;
+  sessionURL = url ?? '';
+  sceneBrowserURL = `http://127.0.0.1:${bridgePort}/`;
+  await call('bridge_status');
   say({ event: 'ready', tools: [...names] });
+  return { connected: true, reused: false, browserURL: sceneBrowserURL };
 }
 async function call(name, args = {}) {
   if (!client) throw new Error('Inspector is not connected');
@@ -56,7 +68,7 @@ async function dispatch(message) {
   const { id, op, args = {} } = message;
   try {
     let result;
-    if (op === 'connect') { await connect(args.project, args.url); say({ id, ok: true, result: { connected: true } }); return; }
+    if (op === 'connect') { const result = await connect(args.project, args.url); say({ id, ok: true, result }); return; }
     if (op === 'close') { await shutdown(); return; }
     if (op === 'tree') {
       const deadline = Date.now() + 45_000;

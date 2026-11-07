@@ -20,7 +20,7 @@ User settings live at `~/Library/Application Support/DEX 3js/settings.json`, sch
 
 ## Control Center dashboard
 
-DEX now starts on a **Control Center** tab. It keeps the existing project launcher while adding live local service status for a configured project URL, the Three.js DevTools scene bridge, Studio API, and Studio editor. After DEX starts a trusted project, **Inspect live scene** opens a persistent session through the installed DevTools MCP and displays the real scene hierarchy and selected object details. Supported material values can be previewed in that browser session and individually or fully reverted; source files are never changed. Studio and the selected project still open through the installed Studio and Chrome/Needle tooling. A reachable endpoint is not proof of Three.js rendering or an MCP client invocation. No new runtime dependency is installed.
+DEX now starts on a **Control Center** tab with an app-forced native dark appearance. It keeps the existing project launcher while adding passive local service checks for a configured project URL, the Three.js DevTools scene bridge, Studio API, and Studio editor. After DEX starts a trusted project, **Inspect live scene** opens one local scene bridge in the system default browser and displays the real scene hierarchy and selected object details. Repeated inspection, object selection, material preview/revert, health refresh, and dashboard navigation reuse the existing MCP session and do not start another browser. Supported material values remain temporary and can be individually or fully reverted; project source files are never changed. Normal project and Studio pages use the default browser. Chrome remains an explicit option for Needle Inspector compatibility. A reachable endpoint is not proof of Three.js rendering or an MCP client invocation. No new runtime dependency is installed.
 
 See [docs/CONTROL_CENTER.md](docs/CONTROL_CENTER.md) for the exact actions, status meanings, editing boundaries, and recovery steps.
 
@@ -38,7 +38,7 @@ Codex Desktop uses `~/.codex/config.toml`; Claude Code in Claude Desktop uses `~
 
 ## Development and validation
 
-`make test` performs Swift typechecking and a macOS process-group smoke test. `make integration-test` runs a temporary loopback development process through the CLI ownership validator and stop path; it refuses to overwrite an existing DEX process record. `make build` creates `build/DEX 3js.app`. `make install` copies the app, CLI and narrowly scoped stop helper to user locations. `make uninstall` removes those copies. The implementation is readable Swift source; configuration reload is live, native code changes require `make run` again.
+`make test` checks the native dark-appearance policy, the real DevTools MCP adapter's repeat-connect/browser lifecycle, local endpoint and bridge responses, Swift typechecking, and process-group smoke behavior. `make integration-test` runs a temporary loopback development process through the CLI ownership validator and stop path; it refuses to overwrite an existing DEX process record. `make build` creates `build/DEX 3js.app`. `make install` copies the app, CLI and narrowly scoped stop helper to user locations. `make uninstall` removes those copies. The implementation is readable Swift source; configuration reload is live, native code changes require `make run` again.
 
 ## Security and limits
 

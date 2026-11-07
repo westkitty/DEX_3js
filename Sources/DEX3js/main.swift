@@ -71,6 +71,7 @@ struct SceneNode: Identifiable, Hashable {
     @Published var previewValue = "0.35"
     @Published var sceneStatus = "Disconnected"
     @Published var sceneSnapshotProject = ""
+    @Published var sceneBrowserURL = ""
     private var sceneProcess: Process?
     private var sceneInput: Pipe?
     private var sceneBuffer = Data()
@@ -313,6 +314,11 @@ struct SceneNode: Identifiable, Hashable {
         message = "Requested Chrome opening; enable Needle Inspector from its extension toolbar"
     }
     func inspectScene() {
+        guard !inspecting else { message = "Scene inspection is already in progress"; return }
+        if sceneProcess != nil {
+            refreshScene()
+            return
+        }
         guard let project = selected, project.trusted else {
             message = "Select a trusted project before launching its inspector"; return
         }
@@ -330,7 +336,7 @@ struct SceneNode: Identifiable, Hashable {
             sceneInput = input; sceneBuffer = Data()
             output.fileHandleForReading.readabilityHandler = { [weak self] handle in let chunk = handle.availableData; guard !chunk.isEmpty else { return }; Task { @MainActor in self?.consumeSceneOutput(chunk) } }
             task.terminationHandler = { [weak self] _ in Task { @MainActor in
-                self?.sceneProcess = nil; self?.sceneInput = nil; self?.inspecting = false
+                self?.sceneProcess = nil; self?.sceneInput = nil; self?.sceneBrowserURL = ""; self?.inspecting = false
                 self?.sceneStatus = self?.sceneSnapshotProject.isEmpty == false ? "Disconnected · cached snapshot: \(self?.sceneSnapshotProject ?? "")" : "Disconnected"
                 self?.health["bridge"] = ProbeObservation(state: .disconnected, detail: "DEX scene inspector disconnected; reconnect to confirm the browser scene")
             } }
@@ -341,9 +347,14 @@ struct SceneNode: Identifiable, Hashable {
         message = "Starting persistent DevTools MCP session"
         sendScene("connect", ["project": project.path, "url": localURL.absoluteString]) { [weak self] result in
             guard let self else { return }; switch result {
-            case .success:
+            case .success(let value):
+                guard let response = value as? [String: Any], let rawBrowserURL = response["browserURL"] as? String, LocalEndpoint.validated(rawBrowserURL) != nil else {
+                    self.inspecting = false; self.sceneStatus = "Error"; self.inspectionOutput = "The DevTools MCP did not return a valid loopback scene URL."; self.message = "Scene bridge setup failed. Disconnect and retry."; return
+                }
+                self.sceneBrowserURL = rawBrowserURL
                 self.sceneStatus = "Connected · awaiting browser scene"
                 self.health["bridge"] = ProbeObservation(state: .disconnected, detail: "MCP session ready; the browser scene is not confirmed yet")
+                self.openSceneBrowser()
                 self.refreshScene()
             case .failure(let error):
                 self.inspecting = false; self.sceneStatus = "Error"
@@ -351,6 +362,16 @@ struct SceneNode: Identifiable, Hashable {
                 self.inspectionOutput = error.localizedDescription
                 self.message = "Scene connection failed. Start the project and open a browser view, then retry."
             }
+        }
+    }
+    func openSceneBrowser() {
+        guard sceneProcess != nil, let url = LocalEndpoint.validated(sceneBrowserURL) else {
+            message = "Scene browser URL is unavailable. Reconnect the inspector from this dashboard."; return
+        }
+        if NSWorkspace.shared.open(url) {
+            message = "Opened the existing scene bridge in your default browser; refresh after it connects"
+        } else {
+            message = "Could not open the scene bridge. Copy this local URL and open it in your default browser: \(sceneBrowserURL)"
         }
     }
     func refreshScene() {
@@ -368,7 +389,7 @@ struct SceneNode: Identifiable, Hashable {
                 self.inspectionOutput = "Loaded \(self.sceneNodes.first?.nodeCount ?? 0) scene nodes from the live MCP response for \(self.sceneSnapshotProject). Large groups are capped per response."
                 self.message = "Live scene refreshed; project source untouched"
                 if !self.selectedScenePath.isEmpty { self.selectSceneObject(self.selectedScenePath) }
-            case .failure(let error): self.sceneStatus = "Error"; self.health["bridge"] = ProbeObservation(state: .disconnected, detail: "MCP is running but scene_tree did not return a scene"); self.inspectionOutput = error.localizedDescription; self.message = "Scene read failed. Check the connection and local browser scene."
+            case .failure(let error): self.sceneStatus = "Error"; self.health["bridge"] = ProbeObservation(state: .disconnected, detail: "MCP is running but scene_tree did not return a scene"); self.inspectionOutput = error.localizedDescription; self.message = "Scene read failed. Use Open scene browser to reconnect, then refresh the scene."
             }
         }
     }
@@ -443,7 +464,8 @@ struct SceneNode: Identifiable, Hashable {
 extension JSONEncoder { static var pretty: JSONEncoder { let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]; return e } }
 @main struct DEX3jsApp: App {
     @StateObject private var store = Store()
-    var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(.light).onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in store.cancelInspection(); store.stop() } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
+    init() { DEXAppearance.applyToApplication() }
+    var body: some Scene { WindowGroup { MainView().environmentObject(store).frame(minWidth: 980, minHeight: 660).preferredColorScheme(DEXAppearance.colorScheme).onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in store.cancelInspection(); store.stop() } }.windowStyle(.titleBar).commands { CommandGroup(after: .newItem) { Button("Reload Configuration") { store.reload() }.keyboardShortcut("r", modifiers: [.command, .option]) } } }
 }
 
 struct MainView: View {
@@ -577,9 +599,10 @@ struct MainView: View {
                 Text("Live hierarchy and object data come from the installed Three.js DevTools MCP. Preview changes live only in its browser session; they never edit project files.")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack {
-                    Button(store.inspecting ? "Inspecting…" : "Inspect live scene") { store.inspectScene() }
-                        .disabled(store.inspecting || store.selected == nil)
+                    Button(store.sceneConnected ? "Inspector session active" : (store.inspecting ? "Inspecting…" : "Inspect live scene")) { store.inspectScene() }
+                        .disabled(store.inspecting || store.sceneConnected || store.selected == nil)
                     Button("Refresh scene") { store.refreshScene() }.disabled(!store.sceneConnected || store.inspecting)
+                    Button("Open scene browser") { store.openSceneBrowser() }.disabled(!store.sceneConnected || store.sceneBrowserURL.isEmpty)
                     Button("Disconnect") { store.cancelInspection() }.disabled(!store.sceneConnected)
                     Button("Copy details") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(store.objectDetails.isEmpty ? store.inspectionOutput : store.objectDetails, forType: .string) }.disabled(store.objectDetails.isEmpty && store.inspectionOutput.isEmpty)
                     Text(store.sceneStatus).font(.caption.weight(.medium)).foregroundStyle(.secondary)
@@ -596,12 +619,17 @@ struct MainView: View {
                         Text(store.selectedScenePath.isEmpty ? "Select an object in the hierarchy" : store.selectedScenePath).font(.caption).textSelection(.enabled)
                         ScrollView { Text(store.objectDetails.isEmpty ? "Select an object to read its properties." : store.objectDetails).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }.frame(minHeight: 180, maxHeight: 260).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
                         Text("TEMPORARY MATERIAL PREVIEW").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                        HStack {
-                            Picker("Property", selection: $store.previewProperty) { ForEach(["roughness", "metalness", "opacity", "emissiveIntensity"], id: \.self) { Text($0).tag($0) } }.frame(width: 180)
-                            TextField("Numeric value", text: $store.previewValue).frame(width: 90)
-                            Button("Preview") { store.previewSceneChange() }.disabled(store.selectedScenePath.isEmpty || !store.sceneConnected)
-                            Button("Show pending") { store.loadPendingChanges() }.disabled(!store.sceneConnected)
-                            Button("Revert all") { store.revertSceneChange() }.disabled(!store.sceneConnected)
+                        VStack(alignment: .leading, spacing: 7) {
+                            HStack(spacing: 8) {
+                                Picker("Property", selection: $store.previewProperty) { ForEach(["roughness", "metalness", "opacity", "emissiveIntensity"], id: \.self) { Text($0).tag($0) } }
+                                    .labelsHidden().accessibilityLabel("Material property").frame(width: 142)
+                                TextField("Value", text: $store.previewValue).frame(width: 74).accessibilityLabel("Numeric preview value")
+                                Button("Preview") { store.previewSceneChange() }.disabled(store.selectedScenePath.isEmpty || !store.sceneConnected)
+                            }
+                            HStack(spacing: 8) {
+                                Button("Show pending") { store.loadPendingChanges() }.disabled(!store.sceneConnected)
+                                Button("Revert all") { store.revertSceneChange() }.disabled(!store.sceneConnected)
+                            }
                         }
                         if !store.pendingChanges.isEmpty { ScrollView { VStack(alignment: .leading, spacing: 5) { Text(store.pendingChanges).font(.system(size: 10, design: .monospaced)).textSelection(.enabled); ForEach(store.pendingChangeIDs, id: \.self) { id in Button("Revert change #\(id)") { store.revertSceneChange(id) }.buttonStyle(.bordered) } }.frame(maxWidth: .infinity, alignment: .leading).padding(6) }.frame(maxHeight: 90).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7)) }
                         Text("Preview requires a supported material on the selected object. Changes remain temporary in the browser and can be reverted here.").font(.caption2).foregroundStyle(.secondary)

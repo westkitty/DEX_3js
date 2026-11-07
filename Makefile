@@ -1,6 +1,6 @@
 APP=build/DEX 3js.app
 BIN=$(APP)/Contents/MacOS/DEX3js
-SOURCES=Sources/DEX3js/main.swift Sources/DEX3js/ToolRuntime.swift
+SOURCES=Sources/DEX3js/main.swift Sources/DEX3js/ToolRuntime.swift Sources/DEX3js/AppearancePolicy.swift
 
 .PHONY: build install run clean test integration-test uninstall
 build:
@@ -20,10 +20,14 @@ run: build
 
 test:
 	node --check Resources/scene-bridge.mjs
+	node Tests/scene-bridge-lifecycle-smoke.mjs
 	swiftc -swift-version 5 -parse-as-library -framework SwiftUI -framework AppKit -typecheck $(SOURCES)
 	swiftc -swift-version 5 Sources/DEX3js/ToolRuntime.swift Tests/ControlCenterSmoke.swift -o /tmp/dex3js-control-center-smoke
 	/tmp/dex3js-control-center-smoke
 	rm -f /tmp/dex3js-control-center-smoke
+	swiftc -swift-version 5 -framework SwiftUI -framework AppKit Sources/DEX3js/AppearancePolicy.swift Tests/AppearanceSmoke.swift -o /tmp/dex3js-appearance-smoke
+	/tmp/dex3js-appearance-smoke
+	rm -f /tmp/dex3js-appearance-smoke
 	swiftc -swift-version 5 Tests/ProcessGroupSmoke.swift -o /tmp/dex3js-process-group-smoke
 	/tmp/dex3js-process-group-smoke
 	rm -f /tmp/dex3js-process-group-smoke

@@ -81,6 +81,41 @@ The desktop automation service recovered after the earlier timeout. The installe
 
 **UPDATED STATUS: INSTALLED APP VISUALLY/RUNTIME VERIFIED FOR THE TESTED WORKFLOWS.** Untested edge cases include the remaining Museum shortcuts individually, VoiceOver, copy-to-clipboard, and Studio service failure recovery. No commit, push, merge, or publish occurred.
 
+## Phase 2 delivery and Phase 3 validation — 2026-11-07 (America/Detroit)
+
+### Git delivery
+
+- Phase 2 commit `94bce0748045a1e5959c35fbea284ff9d03b91f8` was pushed to `origin/feat/dex3js-native-scene-inspector`; remote readback matched that SHA.
+- Phase 3 branch: `feat/dex3js-dark-browser-lifecycle`, based on the verified Phase 2 branch. No Phase 3 commit or push; `main` is unchanged.
+
+### Phase 3 checks and installation
+
+- `make test`: PASS after the final source/layout changes. This includes Swift typecheck, local endpoint/bridge smoke, process-group smoke, app appearance smoke, and an integration smoke using the installed MCP adapter that verifies two connects retain the same MCP PID and local proxy URL without a Chrome descendant.
+- `make integration-test`: PASS on the Phase 3 source before launching the final GUI runtime; disposable process ownership, stale-record handling, and unrelated orphan preservation passed. The final Museum process was left intentionally running, so this check was not repeated over its active ownership record.
+- `make build`: PASS; `make install`: PASS to `/Users/andrew/Applications/DEX 3js.app` and the existing per-user CLI/stop-helper locations.
+- `git diff --check`: PASS after implementation and again after the final documentation append.
+- Installed executable SHA-256: `2c5f64d633eedca6db566f2ba222bab53cfaa89343c6727f86a63a52313f2088`. Installed scene adapter SHA-256: `0235e03b370d8b7e4bb7da99e6a361c34394cbab9df5b2b8cac3d9632e626c3c`.
+
+### Installed GUI/runtime evidence
+
+- DEX was opened from the installed bundle. With macOS Appearance explicitly set to Light, its native window and Control Center (including the scene hierarchy/details and material controls) stayed dark. Projects, Toolbox, Diagnostics, and Configuration had also been inspected in the installed app. macOS Appearance was restored to the user's original Dark selection, and DEX remained dark.
+- Museum of Me was running from DEX at PID `40946`, its configured local URL responded, and the installed MCP returned the live `museum` scene and `night-island-terrain` geometry/material details. Selection and scene refresh worked.
+- A live material preview changed terrain roughness from `0.96` to `0.25`; individual Revert change restored it and the pending list returned to zero. No Museum source files were written.
+- Inspector Disconnect reached the disconnected/cached-snapshot state. Inspect live scene then reconnected and returned a live scene tree.
+- Start Studio was clicked. Its initial API check ran during startup and reported unavailable; the next explicit refresh reported both API (`127.0.0.1:4000/health`) and editor (`127.0.0.1:5180/`) reachable. Open Studio opened the editor in Brave.
+- Tab navigation moved focus to the project search field. Existing configured Museum profile and shortcuts remained present.
+- Process inspection showed no DEX-owned Chrome process. Two observed Chrome processes were children of pre-existing Codex MCP sessions and were left untouched. The default browser was Brave. The scene MCP adapter's regression run confirmed repeat connection retains one MCP PID and URL and starts no Chrome.
+
+### Behavior and remaining limits
+
+The repeated-launch trigger was the adapter's injected headed Puppeteer environment combined with an always-enabled Inspect action that tore down and relaunched an already active MCP transport. Phase 3 disables MCP browser auto-launch, uses one local proxy in the system default browser, reuses the active transport for repeated connects, and disables Inspect while connected. Passive health checks and dashboard navigation do not invoke browser creation.
+
+An explicit Disconnect ends the DEX-owned MCP session. A subsequent explicit Inspect creates a new session on a new loopback proxy port and opens a new Brave tab. That recovery path returned a working scene; DEX could not verify browser-tab ownership, so it preserved the prior proxy tab rather than closing a possibly user-owned tab. Normal refresh, object selection and preview do not create tabs. A simulated close of a browser tab through desktop automation timed out, so that exact tab-close path is not independently verified. Chrome/Needle was an existing Phase 2 GUI-verified route and remains an explicit action; this Phase 3 pass did not click it again to avoid an unnecessary Chrome launch.
+
+Museum Stop/restart ownership and route behavior were verified in the preceding Phase 2 installed receipt. The current final runtime intentionally leaves Museum and Studio running. VoiceOver and full keyboard audit were not performed. No Museum source, exhibits, assets, runtime files or published site were changed. No security setting was changed.
+
+**Phase 2: COMMITTED AND PUSHED (remote SHA verified). Phase 3: SOURCE IMPLEMENTED, TESTED, INSTALLED, AND GUI/RUNTIME VERIFIED for the evidence above; uncommitted and unpushed.**
+
 ## Final requested running state — 2026-11-06 (America/Detroit)
 
 After the installed Stop test passed, Museum was started again from the installed dashboard for the requested live workflow. Chrome displayed the Museum title/arrival screen at `127.0.0.1:5173/`; the Needle Inspector 2.9.0 toolbar control reported access to this site. DEX PID 51021 owns PGID 51021, and the owner-only process record matches the Museum working directory. Port 5173 is listening under that group. This is the intentional final runtime state, not an orphan; Stop was separately verified above. AI Three.js Studio API/web services also remain available from the requested Start Studio action.

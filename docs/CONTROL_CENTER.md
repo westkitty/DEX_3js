@@ -11,9 +11,9 @@ The Control Center is a native Mac dashboard inside the existing DEX 3js launche
 3. If necessary, go to **Projects** and read/approve that project's `dev` script.
 4. Choose **Start project**, then **Open project** or one of the configured project views.
 5. Choose **Refresh connections**. The dashboard reports actual local HTTP responses: selected project URL, DevTools MCP scene bridge, Studio API and Studio web editor.
-6. After DEX reports the project as running and has captured its local URL, choose **Inspect live scene**. The bundled `Resources/scene-bridge.mjs` adapter starts the installed DevTools MCP using its structured API and keeps the session open. The native hierarchy expands on demand; selecting a row requests actual `object_details` and shows the returned transforms, geometry, material, light or camera properties.
+6. After DEX reports the project as running and has captured its local URL, choose **Inspect live scene**. The bundled `Resources/scene-bridge.mjs` adapter starts one DEX-owned MCP session with automatic browser launching disabled, then DEX opens the local scene proxy in the system default browser. The native hierarchy expands on demand; selecting a row requests actual `object_details` and shows returned transforms, geometry, material, light or camera properties.
 7. Choose **Start Studio**, then refresh connections. **Open Studio** becomes available only when the Studio web interface responds.
-8. Choose **Open Needle in Chrome** to open the selected local project in Chrome. Enable the Needle Inspector extension manually from the browser toolbar if required.
+8. Choose **Open Needle in Chrome** only when you need the Chrome-specific Needle extension. Normal project and Studio pages open in the system default browser. Enable the Needle Inspector extension manually from Chrome's toolbar if required.
 
 ## What statuses prove
 
@@ -28,7 +28,9 @@ Other states distinguish Not checked, Checking, Connected, Awaiting scene, Unava
 
 ## Editing discipline
 
-- **Inspect live scene** reads `scene_tree` and `object_details` from the installed Three.js DevTools MCP. It launches its own headed Chrome browser through that toolkit and uses dynamically selected loopback ports so it does not collide with another MCP session. The project URL passed to the MCP server is restricted to local HTTP. A disconnected browser reports an error that can be retried after opening the project.
+- **Inspect live scene** reads `scene_tree` and `object_details` from the installed Three.js DevTools MCP. On the first explicit inspection it starts one DEX-owned MCP process, disables the toolkit's automatic browser launch (`BROWSER=none`), and opens the MCP's loopback scene proxy through macOS's default browser. The MCP bridge uses a dynamically selected local port to avoid collisions. The project URL passed to the MCP server is restricted to local HTTP.
+- Opening DEX, switching its tabs, refreshing connection health, selecting objects, and previewing or reverting material values do not launch browsers. Repeated inspection refreshes the existing live session. If its scene page disconnects, **Open scene browser** reopens the existing local proxy; it does not start another MCP process. **Disconnect** closes only the DEX-owned MCP child. DEX does not terminate browser processes or tabs.
+- The separate shared `3d-lab inspect --project` CLI currently requests headed Puppeteer Chrome. DEX's native inspector does not invoke that CLI path. The **Open Needle in Chrome** button is an explicit compatibility action; project/Studio URL actions use the system default browser.
 - **Temporary material preview** is available for `roughness`, `metalness`, `opacity`, and `emissiveIntensity`, which the installed MCP exposes as numeric material properties. The selected row must resolve to an object with a compatible material. DEX displays the bridge's pending-change record, supports individual change IDs and **Revert all**, and never writes preview values to project source.
 - The MCP scene tree response does not include object UUIDs. DEX addresses named objects by their returned dot path; duplicate names can be ambiguous when the MCP itself cannot distinguish them. Unnamed objects (and descendants beneath them) remain visible but are not selectable because the installed bridge provides no usable identifier. No stable object ID is invented.
 - The native tree creates nested rows lazily and bounds each MCP response to depth 4 and 20 children per node so a very large Museum hierarchy cannot exhaust the dashboard. Groups with more children show the loaded/available counts; refresh re-reads the live scene without restarting DEX.
@@ -42,7 +44,7 @@ Other states distinguish Not checked, Checking, Connected, Awaiting scene, Unava
 - **Project URL unavailable:** Start the trusted project, review its existing dev script and refresh connections after Vite reports readiness.
 - **Bridge awaiting scene:** Keep the project's browser scene open, check the project's local URL, then refresh or reconnect the native inspector.
 - **Studio unavailable:** Start Studio and refresh. If it fails, inspect the shared `3d-lab` logs.
-- **Inspect failed:** Read the native status and message. Reconnect after correcting the local project URL or browser bridge. Disconnect closes the DEX-owned MCP/Chrome session; the project dev server remains separately controlled by DEX's Start/Stop buttons.
+- **Inspect failed:** Read the native status and message. Use **Open scene browser** to reconnect the existing local proxy, then **Refresh scene**. If the MCP process itself stopped, Disconnect if available and choose **Inspect live scene** to create one fresh session. The project dev server remains separately controlled by DEX's Start/Stop buttons.
 - **Needle not visible:** Open the local project in Chrome, enable the extension from the toolbar, then inspect the browser.
 - **No tool installed:** The dashboard explains the missing shared launcher rather than starting an unrelated executable.
 
